@@ -15,11 +15,21 @@ const SESSION_GAP_MS = 20 * 60 * 1000
 const MIN_SPAN_MINUTES = 45
 
 /**
- * Most a single sitting can contribute, however many rows it produced. Bulk
- * creating thirteen tasks is one act, not thirteen. Sub-linear rather than
- * flat-1, so a long focused session on one project still qualifies on its own.
+ * NO CAP on what a single sitting contributes.
+ *
+ * An earlier version capped it at 3, on the reasoning that bulk-creating
+ * thirteen tasks is one act rather than thirteen. That was wrong, and the data
+ * showed it: Charlie posts forty client comments in one morning, which is
+ * genuinely a morning's work, and the cap made it count as three — below the
+ * threshold, so the largest recording gap in the agency produced no findings at
+ * all.
+ *
+ * A task edit and a comment are indistinguishable in the stored data, so the
+ * cap could not tell one from the other. The span rule already suppresses the
+ * admin case (29 minutes of activity is not a working day), and where the count
+ * IS large in one sitting, Echo says so plainly — "40 updates in one sitting" —
+ * and lets the person judge. Reporting honestly beats guessing at intent.
  */
-const MAX_SIGNALS_PER_SESSION = 3
 
 interface Ev {
   person_id: string
@@ -43,7 +53,7 @@ interface Ev {
 export function sessionShape(times: string[]): {
   sessions: number
   spanMinutes: number
-  /** Signals after capping each sitting. This is what the threshold tests. */
+  /** Signals counted against the threshold. Uncapped — see the note above. */
   effective: number
   /** True when everything arrived in one sitting — worth saying out loud. */
   singleSitting: boolean
@@ -55,11 +65,13 @@ export function sessionShape(times: string[]): {
     if (ts[i] - ts[i - 1] > SESSION_GAP_MS) { sizes.push(cur); cur = 1 } else cur++
   }
   sizes.push(cur)
-  const effective = sizes.reduce((a, n) => a + Math.min(n, MAX_SIGNALS_PER_SESSION), 0)
+  const effective = sizes.reduce((a, n) => a + n, 0)
   return {
     sessions: sizes.length,
     spanMinutes: (ts[ts.length - 1] - ts[0]) / 60000,
     effective,
+    // Say "in one sitting" when it was one, so a large number never implies
+    // more separate pieces of work than actually happened.
     singleSitting: sizes.length === 1 && ts.length > 3,
   }
 }
@@ -191,6 +203,7 @@ export async function detectActiveDays(
         evidence_count: rows.length,
         project_count: byProject.size,
         has_completed_task: completed.length > 0,
+        single_sitting: shape.singleSitting,
         role_class_at_detect: person.role_class,
         evidence_hash: hash,
         confidence,
