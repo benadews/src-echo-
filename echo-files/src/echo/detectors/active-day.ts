@@ -3,7 +3,23 @@ import { isWeekend } from '../lib/dates'
 import { chunks } from '../ingest/activities'
 
 const SESSION_GAP_MS = 20 * 60 * 1000
-const MIN_SPAN_MINUTES = 30
+
+/**
+ * A day's activity must be spread over at least this long to count as a working
+ * day. Raised from 30 to 45 after a real false positive: 13 task edits inside
+ * six minutes plus one comment half an hour earlier. That was task admin — Ben
+ * confirmed it — but it passed the old rule because two sessions existed.
+ *
+ * Genuine work spreads over hours. Admin happens in one sitting.
+ */
+const MIN_SPAN_MINUTES = 45
+
+/**
+ * Most a single sitting can contribute, however many rows it produced. Bulk
+ * creating thirteen tasks is one act, not thirteen. Sub-linear rather than
+ * flat-1, so a long focused session on one project still qualifies on its own.
+ */
+const MAX_SIGNALS_PER_SESSION = 3
 
 interface Ev {
   person_id: string
@@ -24,19 +40,37 @@ interface Ev {
  * day. Requiring either 2+ sessions or a 30+ minute span suppressed 3 of 7
  * candidate findings, all correctly.
  */
-export function sessionShape(times: string[]): { sessions: number; spanMinutes: number } {
+export function sessionShape(times: string[]): {
+  sessions: number
+  spanMinutes: number
+  /** Signals after capping each sitting. This is what the threshold tests. */
+  effective: number
+  /** True when everything arrived in one sitting — worth saying out loud. */
+  singleSitting: boolean
+} {
   const ts = times.map((t) => new Date(t).getTime()).sort((a, b) => a - b)
-  let sessions = 1
+  const sizes: number[] = []
+  let cur = 1
   for (let i = 1; i < ts.length; i++) {
-    if (ts[i] - ts[i - 1] > SESSION_GAP_MS) sessions++
+    if (ts[i] - ts[i - 1] > SESSION_GAP_MS) { sizes.push(cur); cur = 1 } else cur++
   }
-  return { sessions, spanMinutes: (ts[ts.length - 1] - ts[0]) / 60000 }
+  sizes.push(cur)
+  const effective = sizes.reduce((a, n) => a + Math.min(n, MAX_SIGNALS_PER_SESSION), 0)
+  return {
+    sessions: sizes.length,
+    spanMinutes: (ts[ts.length - 1] - ts[0]) / 60000,
+    effective,
+    singleSitting: sizes.length === 1 && ts.length > 3,
+  }
 }
 
 export async function detectActiveDays(
   db: SupabaseClient,
   fromDay: string,
   toDay: string,
+  /** Teamwork project id -> name. Without this the nudge says "Project 443386",
+   *  which is useless to a human reading it in Slack. */
+  projectNames: Map<number, string> = new Map(),
 ): Promise<{ evaluated: number; raised: number; suppressed: number }> {
   const { data: people } = await db
     .from('echo_person')
@@ -92,11 +126,13 @@ export async function detectActiveDays(
     if (away === true) { suppressed++; continue }
 
     const shape = sessionShape(rows.map((r) => r.occurred_at))
-    if (shape.sessions < 2 && shape.spanMinutes < MIN_SPAN_MINUTES) { suppressed++; continue }
+    // Span is the primary test now. A day whose entire activity fits inside 45
+    // minutes is admin, not a working day, however many rows it produced.
+    if (shape.spanMinutes < MIN_SPAN_MINUTES) { suppressed++; continue }
 
     // Someone working a Saturday should be credited, not chased — but a weekend
     // with real, spread-out activity is still a day worth asking about.
-    if (isWeekend(day) && rows.length < policy.min_signals * 2) { suppressed++; continue }
+    if (isWeekend(day) && shape.effective < policy.min_signals * 2) { suppressed++; continue }
 
     const minsToday = dayMins.get(key) ?? 0
     const byProject = new Map<number, Ev[]>()
@@ -109,13 +145,15 @@ export async function detectActiveDays(
     const completed = rows.filter((r) => r.source_activity_type === 'completed')
     let kind: string | null = null
 
-    if (minsToday === 0 && rows.length >= policy.min_signals) {
+    if (minsToday === 0 && shape.effective >= policy.min_signals) {
       kind = 'active_day_unlogged'
     } else if (minsToday > 0) {
       // The quietly valuable rule: time recorded somewhere, but a busy project
       // got none of it. Invisible on any total-hours report.
       const untouched = [...byProject.entries()].filter(
-        ([pid, evs]) => evs.length >= policy.min_signals && (projMins.get(`${key}|${pid}`) ?? 0) === 0,
+        ([pid, evs]) =>
+          sessionShape(evs.map((e) => e.occurred_at)).effective >= policy.min_signals &&
+          (projMins.get(`${key}|${pid}`) ?? 0) === 0,
       )
       if (untouched.length) kind = 'active_day_partial'
     }
@@ -157,6 +195,7 @@ export async function detectActiveDays(
         evidence_hash: hash,
         confidence,
         human_summary: summarise(rows.length, completed, ranked.length),
+        // stored for transparency on the dashboard
       })
       .select('id')
       .maybeSingle()
@@ -174,11 +213,13 @@ export async function detectActiveDays(
       return {
         finding_id: finding.id,
         teamwork_project_id: pid,
+        project_name: projectNames.get(pid) ?? `Project ${pid}`,
         signal_count: evs.length,
         first_signal_at: evs.reduce((a, b) => (a.occurred_at < b.occurred_at ? a : b)).occurred_at,
         last_signal_at: evs.reduce((a, b) => (a.occurred_at > b.occurred_at ? a : b)).occurred_at,
         logged_minutes: projMins.get(`${key}|${pid}`) ?? 0,
         has_completed_task: evs.some((e) => e.source_activity_type === 'completed'),
+        single_sitting: shape2.singleSitting,
         session_count: shape2.sessions,
       }
     })
@@ -192,12 +233,33 @@ export async function detectActiveDays(
   return { evaluated, raised, suppressed }
 }
 
+/** Names that are tasklists or headings rather than real tasks. Naming one
+ *  reads oddly — "completed 2 tasks including Development" — so when the name
+ *  is this generic, say nothing about which. */
+const GENERIC = new Set([
+  'development', 'design', 'build', 'qa', 'testing', 'launch', 'admin',
+  'discovery', 'general', 'misc', 'other', 'tasks', 'project management',
+])
+
+function isGeneric(name: string | null): boolean {
+  if (!name) return true
+  const n = name.trim().toLowerCase().replace(/^\d+[.)]\s*/, '')
+  return n.length < 5 || GENERIC.has(n)
+}
+
 function summarise(signals: number, completed: Ev[], projects: number): string {
   const parts: string[] = []
   // A completed task by its own assignee is the strongest signal in the system,
-  // so it is named first.
+  // so it is named first — but only if the name means anything.
   if (completed.length) {
-    parts.push(`Completed ${completed.length === 1 ? '' : `${completed.length} tasks including `}${completed[0].summary ?? 'a task'}`)
+    const name = completed[0].summary
+    if (completed.length === 1 && !isGeneric(name)) {
+      parts.push(`Completed ${name}`)
+    } else if (!isGeneric(name)) {
+      parts.push(`Completed ${completed.length} tasks including ${name}`)
+    } else {
+      parts.push(`Completed ${completed.length} task${completed.length === 1 ? '' : 's'}`)
+    }
   }
   parts.push(`${signals} update${signals === 1 ? '' : 's'} across ${projects} project${projects === 1 ? '' : 's'}`)
   return parts.join(', ')
