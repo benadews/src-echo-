@@ -33,7 +33,9 @@ async function main() {
   }
 
   // Refresh staff + emails from Teamwork, using Teamwork's own client flag.
-  const tp = await teamwork.people()
+  // Dedupe by id: paging can return the same person twice, which made the
+  // roster line report 8 staff out of 8 people plus 1 excluded.
+  const tp = [...new Map((await teamwork.people()).map((p) => [p.id, p])).values()]
   const sync = await syncPeopleFromTeamwork(db, tp, OWN_COMPANY_ID)
   console.log(`Roster: ${sync.staff} staff, ${sync.excluded} excluded (clients/guests).`)
 
@@ -172,20 +174,40 @@ async function buildFooter(db: ReturnType<typeof echoDb>, personId: string, max:
     })
   }
 
-  const { data: mentions } = await db
-    .from('echo_v_open_mentions')
-    .select('task_name:comment_excerpt, asked_by, days_waiting')
-    .eq('mentioned_person_id', personId)
-    .gte('days_waiting', 2)
-    .order('days_waiting', { ascending: false })
-    .limit(Math.max(0, max - items.length))
+  const room = Math.max(0, max - items.length)
+  if (room > 0) {
+    const { data: mentions } = await db
+      .from('echo_v_open_mentions')
+      .select('teamwork_task_id, asked_by, days_waiting, comment_excerpt')
+      .eq('mentioned_person_id', personId)
+      .gte('days_waiting', 2)
+      .order('days_waiting', { ascending: false })
+      .limit(room)
 
-  for (const m of mentions ?? []) {
-    items.push({
-      label: 'Awaiting your reply',
-      title: String((m as { task_name?: string }).task_name ?? '').slice(0, 70),
-      detail: `${m.asked_by} asked ${m.days_waiting} days ago`,
-    })
+    // echo_mention stores only the task id, so resolve names from the stage
+    // history (which holds task_name for every open task). Without this the
+    // footer showed the raw comment text as the title, which read as gibberish.
+    const ids = (mentions ?? []).map((m) => m.teamwork_task_id as number)
+    const names = new Map<number, string>()
+    if (ids.length) {
+      const { data: tasks } = await db
+        .from('echo_task_stage_history')
+        .select('teamwork_task_id, task_name')
+        .in('teamwork_task_id', ids)
+        .is('exited_at', null)
+      for (const t of tasks ?? []) {
+        if (t.task_name) names.set(t.teamwork_task_id as number, t.task_name as string)
+      }
+    }
+
+    for (const m of mentions ?? []) {
+      const taskId = m.teamwork_task_id as number
+      items.push({
+        label: 'Awaiting your reply',
+        title: names.get(taskId) ?? `Task ${taskId}`,
+        detail: `${m.asked_by} asked ${m.days_waiting} days ago`,
+      })
+    }
   }
 
   const { count } = await db
