@@ -6,7 +6,13 @@ import { timeQuestion, footer, assertNoPronouns, ProjectLine, FooterItem } from 
 import { londonDay } from './lib/dates'
 
 const OWN_COMPANY_ID = 119378          // We Take Flight in Teamwork
-const DASHBOARD = process.env.ECHO_DASHBOARD_URL ?? 'https://example.com/echo'
+// Every link in every message points at Teamwork, never at Echo — Teamwork is
+// the system of record for time, and offering a second place to log it is how
+// you end up with time in two systems and trust in neither.
+const TW = process.env.TEAMWORK_BASE_URL ?? 'https://wetakeflight.eu.teamwork.com'
+// Echo is linked ONLY from the footer, for "see the rest of your list". Never
+// for logging time — that always goes to Teamwork.
+const ECHO_URL = process.env.ECHO_DASHBOARD_URL ?? ''
 
 /**
  * Echo nudge — sends the daily DM.
@@ -100,6 +106,7 @@ async function main() {
 
     const lines: ProjectLine[] = (projects ?? []).map((p) => ({
       name: p.project_name ?? `Project ${p.teamwork_project_id}`,
+      projectId: p.teamwork_project_id as number,
       signals: p.signal_count as number,
       from: hhmm(p.first_signal_at as string),
       to: hhmm(p.last_signal_at as string),
@@ -119,7 +126,7 @@ async function main() {
       projects: lines,
       tone: (toneFor.get(person.role_class) === 'soft' ? 'soft' : 'direct'),
       dayLabel: dayLabel(finding.work_date as string),
-      dashboardUrl: DASHBOARD,
+      teamworkBase: TW,
     })
 
     text += await buildFooter(db, person.id, cfg.data?.footer_max_items ?? 3)
@@ -158,7 +165,7 @@ async function buildFooter(db: ReturnType<typeof echoDb>, personId: string, max:
 
   const { data: stale } = await db
     .from('echo_v_stale_tasks')
-    .select('task_name, stage_name, days_in_stage, max_dwell_days, severity, is_legacy_backlog, entered_at_is_estimate')
+    .select('teamwork_task_id, task_name, stage_name, days_in_stage, max_dwell_days, severity, is_legacy_backlog, entered_at_is_estimate')
     .eq('assignee_person_id', personId)
     .eq('breach_owner', 'assignee')
     .eq('is_legacy_backlog', false)
@@ -171,6 +178,7 @@ async function buildFooter(db: ReturnType<typeof echoDb>, personId: string, max:
       label: s.stage_name as string,
       title: s.task_name as string,
       detail: `${s.days_in_stage} days (target ${s.max_dwell_days})`,
+      taskId: s.teamwork_task_id as number,
     })
   }
 
@@ -206,6 +214,7 @@ async function buildFooter(db: ReturnType<typeof echoDb>, personId: string, max:
         label: 'Awaiting your reply',
         title: names.get(taskId) ?? `Task ${taskId}`,
         detail: `${m.asked_by} asked ${m.days_waiting} days ago`,
+        taskId,
       })
     }
   }
@@ -217,7 +226,7 @@ async function buildFooter(db: ReturnType<typeof echoDb>, personId: string, max:
     .eq('breach_owner', 'assignee')
   const hidden = Math.max(0, (count ?? 0) - items.length)
 
-  return footer(items.slice(0, max), hidden, DASHBOARD)
+  return footer(items.slice(0, max), hidden, TW, ECHO_URL || undefined)
 }
 
 function hhmm(iso: string): string {
