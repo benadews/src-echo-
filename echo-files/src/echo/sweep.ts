@@ -7,6 +7,7 @@ import { ingestMentions } from './ingest/mentions'
 import { snapshotStages } from './ingest/stages'
 import { detectActiveDays } from './detectors/active-day'
 import { detectStageDwell } from './detectors/stage-dwell'
+import { detectSilence } from './detectors/silence'
 import { daysAgo, today, londonDay } from './lib/dates'
 
 /**
@@ -82,10 +83,13 @@ async function main() {
     const st = await snapshotStages(db, teamwork, staff, { seedLegacy: firstRun })
     const ad = await detectActiveDays(db, fromDay, toDay, projectNames)
     const sd = await detectStageDwell(db)
+    // Absence, not presence: catches whoever is working outside Teamwork
+    // entirely, who every other detector is blind to by definition.
+    const si = await detectSilence(db, cfg.data?.silence_days ?? 7)
 
     console.log(JSON.stringify(
       { window: `${fromDay}..${toDay}`, firstRun, activity: ev, timelogs: tl,
-        mentions: mn, stages: st, activeDays: ad, stageDwell: sd }, null, 2))
+        mentions: mn, stages: st, activeDays: ad, stageDwell: sd, silence: si }, null, 2))
 
     if (runId) {
       await db.from('echo_run').update({
