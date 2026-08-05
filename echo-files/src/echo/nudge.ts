@@ -99,7 +99,7 @@ async function main() {
 
     const { data: projects } = await db
       .from('echo_finding_project')
-      .select('project_name, teamwork_project_id, signal_count, first_signal_at, last_signal_at')
+      .select('project_name, teamwork_project_id, signal_count, first_signal_at, last_signal_at, single_sitting')
       .eq('finding_id', finding.id)
       .order('signal_count', { ascending: false })
       .limit(4)
@@ -110,6 +110,7 @@ async function main() {
       signals: p.signal_count as number,
       from: hhmm(p.first_signal_at as string),
       to: hhmm(p.last_signal_at as string),
+      singleSitting: p.single_sitting === true,
     }))
     if (!lines.length) {
       console.log(`${person.full_name}: finding has no project breakdown — skipped`)
