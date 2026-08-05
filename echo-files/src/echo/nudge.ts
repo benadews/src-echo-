@@ -84,7 +84,7 @@ async function main() {
     // The most recent unanswered time question.
     const { data: findings } = await db
       .from('echo_finding')
-      .select('id, kind, work_date, evidence_count, has_completed_task, human_summary')
+      .select('id, kind, work_date, evidence_count, has_completed_task, human_summary, single_sitting')
       .eq('person_id', person.id)
       .in('kind', ['active_day_unlogged', 'active_day_partial'])
       .in('status', ['pending'])
@@ -128,6 +128,7 @@ async function main() {
       tone: (toneFor.get(person.role_class) === 'soft' ? 'soft' : 'direct'),
       dayLabel: dayLabel(finding.work_date as string),
       teamworkBase: TW,
+      singleSitting: finding.single_sitting === true,
     })
 
     text += await buildFooter(db, person.id, cfg.data?.footer_max_items ?? 3)
