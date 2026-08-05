@@ -159,7 +159,7 @@ export async function detectActiveDays(
       ;(byProject.get(pid) ?? byProject.set(pid, []).get(pid)!).push(r)
     }
 
-    const completed = rows.filter((r) => r.source_activity_type === 'completed')
+    const completed = rows.filter((r) => (r.source_activity_type ?? '').startsWith('completed'))
     let kind: string | null = null
 
     if (minsToday === 0 && shape.effective >= policy.min_signals) {
@@ -236,7 +236,7 @@ export async function detectActiveDays(
         first_signal_at: evs.reduce((a, b) => (a.occurred_at < b.occurred_at ? a : b)).occurred_at,
         last_signal_at: evs.reduce((a, b) => (a.occurred_at > b.occurred_at ? a : b)).occurred_at,
         logged_minutes: projMins.get(`${key}|${pid}`) ?? 0,
-        has_completed_task: evs.some((e) => e.source_activity_type === 'completed'),
+        has_completed_task: evs.some((e) => (e.source_activity_type ?? '').startsWith('completed')),
         single_sitting: shape2.singleSitting,
         session_count: shape2.sessions,
       }
