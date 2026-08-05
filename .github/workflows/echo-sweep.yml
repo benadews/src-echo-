@@ -19,12 +19,32 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Test Supabase key
+        run: |
+          READ=$(curl -s -o /dev/null -w "%{http_code}" \
+            "$SUPABASE_URL/rest/v1/echo_person?select=id&limit=1" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY")
+          echo "READ echo_person  -> HTTP $READ"
+          WRITE=$(curl -s -o /tmp/w.txt -w "%{http_code}" -X POST \
+            "$SUPABASE_URL/rest/v1/echo_run" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=representation" \
+            -d '{"kind":"keytest"}')
+          echo "WRITE echo_run    -> HTTP $WRITE"
+          echo "--- response ---"
+          head -c 400 /tmp/w.txt
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
       - name: Locate project
         id: find
         run: |
           DIR=$(dirname "$(find . -name package.json -not -path '*/node_modules/*' | head -1)")
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
-          echo "Found package.json in: $DIR"
 
       - run: npm install
         working-directory: ${{ steps.find.outputs.dir }}
