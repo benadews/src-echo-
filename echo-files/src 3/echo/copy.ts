@@ -13,6 +13,7 @@
 
 export interface ProjectLine {
   name: string
+  projectId: number
   signals: number
   from: string   // HH:MM
   to: string     // HH:MM
@@ -22,6 +23,23 @@ export interface FooterItem {
   label: string       // e.g. "Estimating" or "Awaiting your reply"
   title: string
   detail: string
+  taskId?: number
+}
+
+/**
+ * Every link in every message goes to TEAMWORK, never to Echo.
+ *
+ * Ben's rule, and it's the right one: Echo is where the gaps are reported, but
+ * Teamwork is the system of record. Sending people to a dashboard to log time
+ * would put a second place to do it in front of them, which is how you end up
+ * with time in two systems and trust in neither.
+ */
+export function projectTimeUrl(base: string, projectId: number): string {
+  return `${base.replace(/\/$/, '')}/app/projects/${projectId}/time`
+}
+
+export function taskUrl(base: string, taskId: number): string {
+  return `${base.replace(/\/$/, '')}/app/tasks/${taskId}`
 }
 
 const BANNED = [
@@ -45,15 +63,16 @@ export function timeQuestion(opts: {
   projects: ProjectLine[]
   tone: 'direct' | 'soft'
   dayLabel: string
-  dashboardUrl: string
+  teamworkBase: string
 }): string {
-  const { completedTask, signals, projects, tone, dayLabel, dashboardUrl } = opts
+  const { completedTask, signals, projects, tone, dayLabel, teamworkBase } = opts
+  const link = (p: ProjectLine) => `<${projectTimeUrl(teamworkBase, p.projectId)}|*${p.name}*>`
   const lines: string[] = []
 
   if (tone === 'soft') {
     lines.push(`*You were active across ${projects.length} project${projects.length === 1 ? '' : 's'} on ${dayLabel}*`)
     lines.push('')
-    for (const p of projects) lines.push(`• *${p.name}* — ${p.signals} update${p.signals === 1 ? '' : 's'}, ${p.from}–${p.to}`)
+    for (const p of projects) lines.push(`• ${link(p)} — ${p.signals} update${p.signals === 1 ? '' : 's'}, ${p.from}–${p.to}`)
     lines.push('')
     lines.push('Anything there worth logging, or was it mostly internal?')
   } else {
@@ -66,24 +85,38 @@ export function timeQuestion(opts: {
       lines.push(`You posted ${signals} update${signals === 1 ? '' : 's'} across:`)
     }
     lines.push('')
-    for (const p of projects) lines.push(`• *${p.name}* — ${p.signals} update${p.signals === 1 ? '' : 's'}, ${p.from}–${p.to}`)
+    for (const p of projects) lines.push(`• ${link(p)} — ${p.signals} update${p.signals === 1 ? '' : 's'}, ${p.from}–${p.to}`)
     lines.push('')
     lines.push('No time recorded yet. Do you need to log any against these?')
   }
 
   lines.push('')
-  lines.push(`<${dashboardUrl}|Open Echo> · or log it in Teamwork directly`)
+  lines.push('_Tap a project to log time in Teamwork._')
 
   const out = lines.join('\n')
   assertNoPronouns(out)
   return out
 }
 
-export function footer(items: FooterItem[], hiddenCount: number, dashboardUrl: string): string {
+export function footer(
+  items: FooterItem[],
+  hiddenCount: number,
+  teamworkBase: string,
+  /** Echo link for the attention list only. Time logging always goes to
+   *  Teamwork; this is just "see the rest of your list". */
+  echoUrl?: string,
+): string {
   if (!items.length) return ''
   const lines = ['', '───────────', '*Needs your attention*', '']
-  for (const i of items) lines.push(`• *${i.label}* — ${i.title}\n   ${i.detail}`)
-  if (hiddenCount > 0) lines.push('', `_+ ${hiddenCount} more · <${dashboardUrl}|see all>_`)
+  for (const i of items) {
+    const title = i.taskId ? `<${taskUrl(teamworkBase, i.taskId)}|${i.title}>` : i.title
+    lines.push(`• *${i.label}* — ${title}\n   ${i.detail}`)
+  }
+  if (hiddenCount > 0) {
+    lines.push('', echoUrl
+      ? `_+ ${hiddenCount} more · <${echoUrl}|see your list>_`
+      : `_+ ${hiddenCount} more_`)
+  }
   const out = lines.join('\n')
   assertNoPronouns(out)
   return out
