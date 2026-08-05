@@ -40,6 +40,9 @@ export async function ingestActivities(
     if (!a.userId || !staff.has(a.userId)) continue
     if (!EVIDENCE_TYPES.has(a.type)) continue
     if (a.itemId == null) continue
+    // A reaction is not evidence of anything. An emoji is how people
+    // acknowledge without acting — the opposite of the signal Echo wants.
+    if (a.activityType === 'reacted') continue
 
     // Teamwork emits the same comment repeatedly as separate activity rows —
     // one 'new', then an 'edited' row per revision — with different activity
