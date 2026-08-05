@@ -132,3 +132,32 @@ export function footer(
   assertNoPronouns(out)
   return out
 }
+
+/**
+ * The silence question.
+ *
+ * A statement about the RECORD, never about the person. Echo knows Teamwork is
+ * empty; it has no idea whether work happened, which is exactly why it asks
+ * rather than tells. "Working outside Teamwork" is offered first and treated as
+ * a completely acceptable answer.
+ */
+export function silenceQuestion(opts: {
+  days: number
+  openTasks: number
+  teamworkBase: string
+}): string {
+  const { days, openTasks, teamworkBase } = opts
+  const lines = [
+    `*Nothing's come through from you in Teamwork for ${days} days* 👋`,
+    '',
+    `You've got ${openTasks} task${openTasks === 1 ? '' : 's'} assigned, and there's no ` +
+      `activity or time recorded against any of them in that window.`,
+    '',
+    `Are you working outside Teamwork at the moment, or is something in the way?`,
+    '',
+    `<${teamworkBase.replace(/\/$/, '')}/app/tasks|See your tasks in Teamwork>`,
+  ]
+  const out = lines.join('\n')
+  assertNoPronouns(out)
+  return out
+}
