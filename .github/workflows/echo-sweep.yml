@@ -17,22 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-
-      - name: Check secrets
-        run: |
-          echo "URL length (want 40): ${#SUPABASE_URL}"
-          case "$SUPABASE_URL" in https://*) echo "URL starts https: yes";; *) echo "URL starts https: NO";; esac
-          case "$SUPABASE_URL" in *[[:space:]]*) echo "URL whitespace: YES BAD";; *) echo "URL whitespace: none";; esac
-          echo "KEY length: ${#SUPABASE_SERVICE_ROLE_KEY}"
-          case "$SUPABASE_SERVICE_ROLE_KEY" in sb_secret_*) echo "KEY type: sb_secret - CORRECT";; sb_publishable_*) echo "KEY type: sb_publishable - WRONG ONE";; eyJ*) echo "KEY type: legacy JWT - check if service_role";; *) echo "KEY type: unrecognised";; esac
-          echo "TW token length: ${#TEAMWORK_API_TOKEN}"
-          echo "TW url length (want 38): ${#TEAMWORK_BASE_URL}"
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          TEAMWORK_API_TOKEN: ${{ secrets.TEAMWORK_API_TOKEN }}
-          TEAMWORK_BASE_URL: ${{ secrets.TEAMWORK_BASE_URL }}
+          node-version: '22'
 
       - name: Locate project
         id: find
