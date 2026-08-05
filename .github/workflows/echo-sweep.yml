@@ -18,14 +18,28 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+
+      - name: Check secrets
+        run: |
+          echo "URL length (should be 40): ${#SUPABASE_URL}"
+          case "$SUPABASE_URL" in https://*) echo "URL starts https: yes";; *) echo "URL starts https: NO";; esac
+          case "$SUPABASE_URL" in *[[:space:]]*) echo "URL has whitespace: YES";; *) echo "URL has whitespace: no";; esac
+          echo "KEY length (should be 200+): ${#SUPABASE_SERVICE_ROLE_KEY}"
+          case "$SUPABASE_SERVICE_ROLE_KEY" in eyJ*) echo "KEY looks like a key: yes";; *) echo "KEY looks like a key: NO";; esac
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
       - name: Locate project
         id: find
         run: |
           DIR=$(dirname "$(find . -name package.json -not -path '*/node_modules/*' | head -1)")
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
           echo "Found package.json in: $DIR"
+
       - run: npm install
         working-directory: ${{ steps.find.outputs.dir }}
+
       - run: npx tsx src/echo/sweep.ts
         working-directory: ${{ steps.find.outputs.dir }}
         env:
