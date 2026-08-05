@@ -1,0 +1,42 @@
+name: echo-escalate
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview only — print, send nothing'
+        type: boolean
+        default: true
+
+concurrency:
+  group: echo-escalate
+  cancel-in-progress: false
+
+jobs:
+  escalate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Locate project
+        id: find
+        run: |
+          DIR=$(dirname "$(find . -name package.json -not -path '*/node_modules/*' | head -1)")
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+      - run: npm install
+        working-directory: ${{ steps.find.outputs.dir }}
+      - run: npx tsx src/echo/escalate.ts
+        working-directory: ${{ steps.find.outputs.dir }}
+        env:
+          ECHO_DRY_RUN: ${{ inputs.dry_run }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEAMWORK_API_TOKEN: ${{ secrets.TEAMWORK_API_TOKEN }}
+          TEAMWORK_BASE_URL: ${{ secrets.TEAMWORK_BASE_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          ECHO_DASHBOARD_URL: ${{ secrets.ECHO_DASHBOARD_URL }}
