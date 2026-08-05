@@ -1,116 +1,140 @@
-import { echoDb } from './lib/supabase'
-import { teamwork } from './lib/teamwork'
-import { staffByTeamworkId } from './roles'
-import { ingestActivities } from './ingest/activities'
-import { ingestTimelogs } from './ingest/timelogs'
-import { ingestMentions } from './ingest/mentions'
-import { snapshotStages } from './ingest/stages'
-import { detectActiveDays } from './detectors/active-day'
-import { detectStageDwell } from './detectors/stage-dwell'
-import { daysAgo, today, londonDay } from './lib/dates'
-
 /**
- * Echo sweep — Phase 1. Detection only. Sends nothing.
+ * Minimal Teamwork client for Echo.
  *
- * Every database call reports its own error rather than silently returning
- * null. An earlier version crashed while trying to RECORD a failure, which hid
- * the real cause — so error handling here is deliberately loud and explicit.
+ * If Victor already exposes a client with a rate limiter, delete the fetch
+ * implementation below and pass Victor's in — everything downstream only needs
+ * the `TeamworkApi` interface.
  */
-async function main() {
-  const db = echoDb()
 
-  // Prove the connection before anything else, with a message that says what to
-  // do rather than just what broke.
-  const probe = await db.from('echo_person').select('id, full_name, is_staff').eq('is_staff', true)
-  if (probe.error) {
-    throw new Error(
-      `Cannot read echo_person: ${probe.error.message}\n` +
-      `  -> Either the schema has not been run in Supabase, or SUPABASE_SERVICE_ROLE_KEY is not the secret key.`,
-    )
-  }
-  console.log(`Connected. ${probe.data?.length ?? 0} staff found.`)
-  if (!probe.data?.length) {
-    throw new Error('No staff rows in echo_person — did the schema seed run?')
-  }
-
-  const cfg = await db.from('echo_config').select('*').eq('id', 1).maybeSingle()
-  if (cfg.error) throw new Error(`Cannot read echo_config: ${cfg.error.message}`)
-  const windowDays: number = cfg.data?.window_days ?? 14
-
-  // Write test. If this fails the key is readable but not writable, which means
-  // it is the publishable key rather than the secret one.
-  const runIns = await db
-    .from('echo_run')
-    .insert({ kind: 'sweep', github_run_id: process.env.GITHUB_RUN_ID ?? null })
-    .select('id')
-    .maybeSingle()
-  if (runIns.error) {
-    throw new Error(
-      `Cannot write to echo_run: ${runIns.error.message}\n` +
-      `  -> The key can read but not write. Use the SECRET key from Supabase (the one hidden behind Reveal), not the publishable one.`,
-    )
-  }
-  const runId: string | null = runIns.data?.id ?? null
-  if (!runId) console.warn('echo_run insert returned no row; continuing without run tracking.')
-
-  // Today is excluded: a day still in progress always looks unlogged.
-  const toDay = londonDay(new Date(Date.now() - 86_400_000))
-  const fromDay = daysAgo(windowDays)
-
-  try {
-    const staff = await staffByTeamworkId(db)
-
-    const priorRuns = await db
-      .from('echo_run')
-      .select('id', { count: 'exact', head: true })
-      .eq('kind', 'sweep')
-      .eq('ok', true)
-    const firstRun = (priorRuns.count ?? 0) === 0
-
-    console.log(`Window ${fromDay}..${toDay}. First run: ${firstRun}.`)
-
-    const acts = await teamwork.activities({ start: fromDay, end: today() })
-    console.log(`Teamwork activity rows: ${acts.length}`)
-
-    const ev = await ingestActivities(db, teamwork, staff, fromDay, toDay)
-    const tl = await ingestTimelogs(db, teamwork, staff, fromDay, toDay)
-    const mn = await ingestMentions(db, acts, staff)
-    const st = await snapshotStages(db, teamwork, staff, { seedLegacy: firstRun })
-    const ad = await detectActiveDays(db, fromDay, toDay)
-    const sd = await detectStageDwell(db)
-
-    console.log(JSON.stringify(
-      { window: `${fromDay}..${toDay}`, firstRun, activity: ev, timelogs: tl,
-        mentions: mn, stages: st, activeDays: ad, stageDwell: sd }, null, 2))
-
-    if (runId) {
-      await db.from('echo_run').update({
-        finished_at: new Date().toISOString(),
-        ok: true,
-        evidence_ingested: ev.inserted,
-        findings_created: ad.raised + sd.breaches,
-        nudges_sent: 0,
-      }).eq('id', runId)
-    }
-  } catch (err) {
-    // Record the failure if we can, but NEVER let that reporting hide the
-    // original error — which is exactly the bug this replaces.
-    if (runId) {
-      try {
-        await db.from('echo_run').update({
-          finished_at: new Date().toISOString(), ok: false, error: String(err),
-        }).eq('id', runId)
-      } catch {
-        console.error('(could not record the failure in echo_run)')
-      }
-    }
-    throw err
-  }
+export interface Activity {
+  id: number
+  userId: number | null
+  projectId: number | null
+  itemId: number | null
+  type: string
+  activityType: string
+  dateTime: string
+  description: string | null
+  extraDescription: string | null
+  link: string | null
+  meta?: { notifiedUserIds?: number[] } | null
 }
 
-main().catch((e) => {
-  console.error('\n=== SWEEP FAILED ===')
-  console.error(e instanceof Error ? e.message : e)
-  if (e instanceof Error && e.stack) console.error(e.stack.split('\n').slice(1, 4).join('\n'))
-  process.exit(1)
-})
+export interface Timelog {
+  id: number
+  userId: number
+  projectId: number | null
+  taskId: number | null
+  minutes: number
+  description: string | null
+  isBillable: boolean
+  isLocked: boolean
+  timeLogged: string
+  createdAt: string
+}
+
+export interface Task {
+  id: number
+  name: string
+  estimateMinutes: number | null
+  updatedAt: string
+  assignees?: { id: number }[]
+  workflowStages?: { stageId: number; workflowId: number }[]
+}
+
+export interface Person {
+  id: number
+  firstName: string
+  lastName: string
+  email: string | null
+  /** Teamwork's own client/guest flag. More trustworthy than any mapping we
+   *  maintain: PJ Holdsworth is isClientUser true with a @muffle.co.uk address. */
+  isClientUser: boolean
+  isServiceAccount: boolean
+  companyId: number
+  timezone: string | null
+}
+
+export interface Project {
+  id: number
+  name: string
+}
+
+export interface TeamworkApi {
+  activities(opts: { start: string; end: string }): Promise<Activity[]>
+  timelogs(opts: { start: string; end: string }): Promise<Timelog[]>
+  openTasks(): Promise<Task[]>
+  task(id: number): Promise<Task>
+  people(): Promise<Person[]>
+  projects(): Promise<Project[]>
+}
+
+const BASE = process.env.TEAMWORK_BASE_URL ?? 'https://wetakeflight.eu.teamwork.com'
+
+async function tw<T>(path: string, params: Record<string, string | number>): Promise<T> {
+  const token = process.env.TEAMWORK_API_TOKEN
+  if (!token) throw new Error('TEAMWORK_API_TOKEN is required')
+  const qs = new URLSearchParams(
+    Object.entries(params).map(([k, v]) => [k, String(v)]),
+  )
+  const res = await fetch(`${BASE}${path}?${qs}`, {
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${token}:x`).toString('base64')}`,
+      Accept: 'application/json',
+    },
+  })
+  if (res.status === 429) {
+    const wait = Number(res.headers.get('retry-after') ?? 5)
+    await new Promise((r) => setTimeout(r, wait * 1000))
+    return tw<T>(path, params)
+  }
+  if (!res.ok) throw new Error(`Teamwork ${path} -> ${res.status} ${await res.text()}`)
+  return (await res.json()) as T
+}
+
+/**
+ * Pages until exhausted.
+ *
+ * NOTE on activities: the server-side date filter is NOT reliable — a query
+ * scoped to 4 August returns events stamped 5 August (verified against the live
+ * account). Callers must filter on `dateTime` themselves. The date params are
+ * still passed to bound the amount of paging, not to trust the result.
+ */
+async function pageAll<T>(
+  path: string,
+  key: string,
+  params: Record<string, string | number>,
+): Promise<T[]> {
+  const out: T[] = []
+  for (let page = 1; page <= 200; page++) {
+    const body = await tw<Record<string, unknown>>(path, { ...params, page, pageSize: 250 })
+    const rows = (body[key] ?? []) as T[]
+    out.push(...rows)
+    const meta = body.meta as { page?: { hasMore?: boolean } } | undefined
+    if (!meta?.page?.hasMore) break
+  }
+  return out
+}
+
+export const teamwork: TeamworkApi = {
+  activities: ({ start, end }) =>
+    pageAll<Activity>('/projects/api/v3/latestactivity.json', 'activities', {
+      startDate: start,
+      endDate: end,
+    }),
+  timelogs: ({ start, end }) =>
+    pageAll<Timelog>('/projects/api/v3/time.json', 'timelogs', {
+      startDate: start,
+      endDate: end,
+    }),
+  openTasks: () =>
+    pageAll<Task>('/projects/api/v3/tasks.json', 'tasks', {
+      includeCompletedTasks: 'false',
+    }),
+  task: (id) =>
+    tw<{ task: Task }>(`/projects/api/v3/tasks/${id}.json`, {}).then((r) => r.task),
+  people: () =>
+    pageAll<Person>('/projects/api/v3/people.json', 'people', { type: 'account' }),
+  projects: () =>
+    pageAll<Project>('/projects/api/v3/projects.json', 'projects', {}),
+}
