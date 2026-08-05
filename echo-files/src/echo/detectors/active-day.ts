@@ -4,6 +4,30 @@ import { chunks } from '../ingest/activities'
 const SESSION_GAP_MS = 20 * 60 * 1000
 
 /**
+ * What counts as evidence that work happened.
+ *
+ * Settled by looking at two days Ben confirmed by hand:
+ *
+ *   22 Jul — ADMIN     26 edited:task, 1 reacted:task_comment. No comments, no
+ *                      completions. "Sorting out the tasks, nothing billable."
+ *   03 Aug — REAL WORK 7 new:task_comment, 1 completed:task, 9 edited:task
+ *
+ * So: writing a comment or finishing a task means work happened. Creating,
+ * editing or moving a task is bookkeeping — necessary, but not the thing anyone
+ * bills for, and it is what both false positives were made of.
+ *
+ * Admin signals are still stored and still shown on the dashboard. They just do
+ * not answer the question "was this a working day".
+ */
+function isWorkSignal(activityType: string | null): boolean {
+  const t = activityType ?? ''
+  if (t.startsWith('completed')) return true          // finished something
+  if (t.includes('comment') && !t.startsWith('reacted')) return true  // wrote something
+  if (t.endsWith(':file')) return true                // produced something
+  return false                                        // task create/edit/move
+}
+
+/**
  * A day's activity must be spread over at least this long to count as a working
  * day. Raised from 30 to 45 after a real false positive: 13 task edits inside
  * six minutes plus one comment half an hour earlier. That was task admin — Ben
@@ -136,10 +160,14 @@ export async function detectActiveDays(
     const { data: away } = await db.rpc('echo_is_away', { p_person: personId, p_date: day })
     if (away === true) { suppressed++; continue }
 
+    // Span is measured over ALL activity — it answers "was this person around
+    // across the day". The threshold is measured over WORK signals only — that
+    // answers "was any of it billable work". Two different questions.
     const shape = sessionShape(rows.map((r) => r.occurred_at))
-    // Span is the primary test now. A day whose entire activity fits inside 45
-    // minutes is admin, not a working day, however many rows it produced.
     if (shape.spanMinutes < MIN_SPAN_MINUTES) { suppressed++; continue }
+
+    const workRows = rows.filter((r) => isWorkSignal(r.source_activity_type))
+    if (workRows.length === 0) { suppressed++; continue }
 
     // NO special treatment for weekends or evenings. Ben's rule: activity is
     // activity, wherever it falls, and it should be picked up under the same
@@ -162,14 +190,14 @@ export async function detectActiveDays(
     const completed = rows.filter((r) => (r.source_activity_type ?? '').startsWith('completed'))
     let kind: string | null = null
 
-    if (minsToday === 0 && shape.effective >= policy.min_signals) {
+    if (minsToday === 0 && workRows.length >= policy.min_signals) {
       kind = 'active_day_unlogged'
     } else if (minsToday > 0) {
       // The quietly valuable rule: time recorded somewhere, but a busy project
       // got none of it. Invisible on any total-hours report.
       const untouched = [...byProject.entries()].filter(
         ([pid, evs]) =>
-          sessionShape(evs.map((e) => e.occurred_at)).effective >= policy.min_signals &&
+          evs.filter((e) => isWorkSignal(e.source_activity_type)).length >= policy.min_signals &&
           (projMins.get(`${key}|${pid}`) ?? 0) === 0,
       )
       if (untouched.length) kind = 'active_day_partial'
@@ -180,7 +208,8 @@ export async function detectActiveDays(
     let confidence = 0.5 + (completed.length ? 0.3 : 0) + (policy.confidence_bonus ?? 0)
     confidence = Math.max(0, Math.min(1, confidence))
 
-    const ranked = [...byProject.entries()].sort((a, b) => b[1].length - a[1].length)
+    const workOf = (evs: Ev[]) => evs.filter((e) => isWorkSignal(e.source_activity_type)).length
+    const ranked = [...byProject.entries()].sort((a, b) => workOf(b[1]) - workOf(a[1]))
     const hash = hashOf(rows.map((r) => r.source_item_id).sort())
 
     // Select-then-insert rather than upsert with on_conflict. The idempotency
@@ -205,14 +234,16 @@ export async function detectActiveDays(
         kind,
         work_date: day,
         logged_minutes: minsToday,
-        evidence_count: rows.length,
+        // The number Echo quotes is WORK signals — quoting 27 when 26 were task
+        // edits reads as exaggeration and loses trust.
+        evidence_count: workRows.length,
         project_count: byProject.size,
         has_completed_task: completed.length > 0,
         single_sitting: shape.singleSitting,
         role_class_at_detect: person.role_class,
         evidence_hash: hash,
         confidence,
-        human_summary: summarise(rows.length, completed, ranked.length),
+        human_summary: summarise(workRows.length, completed, ranked.length),
         // stored for transparency on the dashboard
       })
       .select('id')
@@ -226,13 +257,13 @@ export async function detectActiveDays(
     raised++
 
     // The ranked project breakdown IS the content of the nudge.
-    const kids = ranked.map(([pid, evs]) => {
+    const kids = ranked.filter(([, evs]) => workOf(evs) > 0).map(([pid, evs]) => {
       const shape2 = sessionShape(evs.map((e) => e.occurred_at))
       return {
         finding_id: finding.id,
         teamwork_project_id: pid,
         project_name: projectNames.get(pid) ?? `Project ${pid}`,
-        signal_count: evs.length,
+        signal_count: workOf(evs),
         first_signal_at: evs.reduce((a, b) => (a.occurred_at < b.occurred_at ? a : b)).occurred_at,
         last_signal_at: evs.reduce((a, b) => (a.occurred_at > b.occurred_at ? a : b)).occurred_at,
         logged_minutes: projMins.get(`${key}|${pid}`) ?? 0,
