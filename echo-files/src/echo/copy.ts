@@ -17,6 +17,9 @@ export interface ProjectLine {
   signals: number
   from: string   // HH:MM
   to: string     // HH:MM
+  /** All of it arrived in one sitting. Worth saying: "13 updates" on a day
+   *  someone spent six minutes tidying a task list reads as exaggeration. */
+  singleSitting?: boolean
 }
 
 export interface FooterItem {
@@ -67,12 +70,16 @@ export function timeQuestion(opts: {
 }): string {
   const { completedTask, signals, projects, tone, dayLabel, teamworkBase } = opts
   const link = (p: ProjectLine) => `<${projectTimeUrl(teamworkBase, p.projectId)}|*${p.name}*>`
+  const count = (p: ProjectLine) =>
+    `${p.signals} update${p.signals === 1 ? '' : 's'}` +
+    (p.singleSitting ? ' in one sitting' : '') +
+    `, ${p.from}–${p.to}`
   const lines: string[] = []
 
   if (tone === 'soft') {
     lines.push(`*You were active across ${projects.length} project${projects.length === 1 ? '' : 's'} on ${dayLabel}*`)
     lines.push('')
-    for (const p of projects) lines.push(`• ${link(p)} — ${p.signals} update${p.signals === 1 ? '' : 's'}, ${p.from}–${p.to}`)
+    for (const p of projects) lines.push(`• ${link(p)} — ${count(p)}`)
     lines.push('')
     lines.push('Anything there worth logging, or was it mostly internal?')
   } else {
@@ -85,7 +92,7 @@ export function timeQuestion(opts: {
       lines.push(`You posted ${signals} update${signals === 1 ? '' : 's'} across:`)
     }
     lines.push('')
-    for (const p of projects) lines.push(`• ${link(p)} — ${p.signals} update${p.signals === 1 ? '' : 's'}, ${p.from}–${p.to}`)
+    for (const p of projects) lines.push(`• ${link(p)} — ${count(p)}`)
     lines.push('')
     lines.push('No time recorded yet. Do you need to log any against these?')
   }
