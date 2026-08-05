@@ -9,9 +9,18 @@ import { detectActiveDays } from './detectors/active-day'
 import { detectStageDwell } from './detectors/stage-dwell'
 import { daysAgo, today, londonDay } from './lib/dates'
 
+/**
+ * Echo sweep — Phase 1. Detection only. Sends nothing.
+ *
+ * Every database call reports its own error rather than silently returning
+ * null. An earlier version crashed while trying to RECORD a failure, which hid
+ * the real cause — so error handling here is deliberately loud and explicit.
+ */
 async function main() {
   const db = echoDb()
 
+  // Prove the connection before anything else, with a message that says what to
+  // do rather than just what broke.
   const probe = await db.from('echo_person').select('id, full_name, is_staff').eq('is_staff', true)
   if (probe.error) {
     throw new Error(
@@ -28,6 +37,8 @@ async function main() {
   if (cfg.error) throw new Error(`Cannot read echo_config: ${cfg.error.message}`)
   const windowDays: number = cfg.data?.window_days ?? 14
 
+  // Write test. If this fails the key is readable but not writable, which means
+  // it is the publishable key rather than the secret one.
   const runIns = await db
     .from('echo_run')
     .insert({ kind: 'sweep', github_run_id: process.env.GITHUB_RUN_ID ?? null })
@@ -42,6 +53,7 @@ async function main() {
   const runId: string | null = runIns.data?.id ?? null
   if (!runId) console.warn('echo_run insert returned no row; continuing without run tracking.')
 
+  // Today is excluded: a day still in progress always looks unlogged.
   const toDay = londonDay(new Date(Date.now() - 86_400_000))
   const fromDay = daysAgo(windowDays)
 
@@ -81,6 +93,8 @@ async function main() {
       }).eq('id', runId)
     }
   } catch (err) {
+    // Record the failure if we can, but NEVER let that reporting hide the
+    // original error — which is exactly the bug this replaces.
     if (runId) {
       try {
         await db.from('echo_run').update({

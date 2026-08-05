@@ -42,11 +42,25 @@ export interface Task {
   workflowStages?: { stageId: number; workflowId: number }[]
 }
 
+export interface Person {
+  id: number
+  firstName: string
+  lastName: string
+  email: string | null
+  /** Teamwork's own client/guest flag. More trustworthy than any mapping we
+   *  maintain: PJ Holdsworth is isClientUser true with a @muffle.co.uk address. */
+  isClientUser: boolean
+  isServiceAccount: boolean
+  companyId: number
+  timezone: string | null
+}
+
 export interface TeamworkApi {
   activities(opts: { start: string; end: string }): Promise<Activity[]>
   timelogs(opts: { start: string; end: string }): Promise<Timelog[]>
   openTasks(): Promise<Task[]>
   task(id: number): Promise<Task>
+  people(): Promise<Person[]>
 }
 
 const BASE = process.env.TEAMWORK_BASE_URL ?? 'https://wetakeflight.eu.teamwork.com'
@@ -113,4 +127,6 @@ export const teamwork: TeamworkApi = {
     }),
   task: (id) =>
     tw<{ task: Task }>(`/projects/api/v3/tasks/${id}.json`, {}).then((r) => r.task),
+  people: () =>
+    pageAll<Person>('/projects/api/v3/people.json', 'people', { type: 'account' }),
 }

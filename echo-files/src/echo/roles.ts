@@ -75,3 +75,39 @@ export async function staffByTeamworkId(db: SupabaseClient) {
     .eq('is_staff', true)
   return new Map((data ?? []).map((p) => [p.teamwork_user_id as number, p]))
 }
+
+/**
+ * Sync the roster straight from Teamwork, using Teamwork's OWN client flag.
+ *
+ * This replaces the opex dependency for the safety-critical part. Teamwork
+ * marks client and guest accounts with isClientUser, which is more trustworthy
+ * than any mapping we maintain by hand — and it is the difference between Echo
+ * messaging a colleague and Echo messaging a client.
+ *
+ * Roles (delivery / client_facing) still come from the seed or opex; this only
+ * governs WHO IS STAFF and fills in email addresses for Slack lookup.
+ */
+export async function syncPeopleFromTeamwork(
+  db: SupabaseClient,
+  people: {
+    id: number; firstName: string; lastName: string; email: string | null
+    isClientUser: boolean; isServiceAccount: boolean; companyId: number
+  }[],
+  ownCompanyId: number,
+): Promise<{ staff: number; excluded: number }> {
+  let staff = 0, excluded = 0
+  for (const p of people) {
+    const isStaff = !p.isClientUser && !p.isServiceAccount && p.companyId === ownCompanyId
+    if (isStaff) staff++; else excluded++
+    await db
+      .from('echo_person')
+      .update({
+        email: p.email,
+        is_staff: isStaff,
+        is_external: !isStaff,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('teamwork_user_id', p.id)
+  }
+  return { staff, excluded }
+}
