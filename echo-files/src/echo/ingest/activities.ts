@@ -55,7 +55,12 @@ export async function ingestActivities(
       tier: 'A',
       source: 'tw_activity',
       source_item_id: String(a.itemId),
-      source_activity_type: a.activityType,
+      // Composite: what happened AND to what. Stored because two confirmed
+      // false positives (13 task edits in 6 minutes; 25 task edits spread over
+      // an afternoon) were both task admin, and were indistinguishable from
+      // client comments without this. No schema change needed — the column was
+      // free-form text and only ever tested for 'completed'.
+      source_activity_type: `${a.activityType}:${a.type}`,
       occurred_at: a.dateTime,
       work_date: day,
       teamwork_project_id: a.projectId,
