@@ -1,5 +1,4 @@
 import { SupabaseClient } from '@supabase/supabase-js'
-import { isWeekend } from '../lib/dates'
 import { chunks } from '../ingest/activities'
 
 const SESSION_GAP_MS = 20 * 60 * 1000
@@ -142,9 +141,15 @@ export async function detectActiveDays(
     // minutes is admin, not a working day, however many rows it produced.
     if (shape.spanMinutes < MIN_SPAN_MINUTES) { suppressed++; continue }
 
-    // Someone working a Saturday should be credited, not chased — but a weekend
-    // with real, spread-out activity is still a day worth asking about.
-    if (isWeekend(day) && shape.effective < policy.min_signals * 2) { suppressed++; continue }
+    // NO special treatment for weekends or evenings. Ben's rule: activity is
+    // activity, wherever it falls, and it should be picked up under the same
+    // rules as any other day. Chris worked two Sundays in the sample window —
+    // 22 updates across 6 projects on one of them — and that is time no client
+    // is being billed for and no record exists of.
+    //
+    // Detection is not delivery: the nudge job only runs on weekdays, so a
+    // Sunday finding surfaces on Monday. Echo notices the weekend; it does not
+    // message anyone on one.
 
     const minsToday = dayMins.get(key) ?? 0
     const byProject = new Map<number, Ev[]>()
