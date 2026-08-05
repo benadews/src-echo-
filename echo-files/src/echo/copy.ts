@@ -67,8 +67,12 @@ export function timeQuestion(opts: {
   tone: 'direct' | 'soft'
   dayLabel: string
   teamworkBase: string
+  /** Whole day arrived in one sitting. Said out loud so a big number never
+   *  implies more separate pieces of work than actually happened. */
+  singleSitting?: boolean
 }): string {
   const { completedTask, signals, projects, tone, dayLabel, teamworkBase } = opts
+  const sitting = opts.singleSitting ? ' in one sitting' : ''
   const link = (p: ProjectLine) => `<${projectTimeUrl(teamworkBase, p.projectId)}|*${p.name}*>`
   const count = (p: ProjectLine) =>
     `${p.signals} update${p.signals === 1 ? '' : 's'}` +
@@ -87,9 +91,9 @@ export function timeQuestion(opts: {
     lines.push('')
     // A completed task by its own assignee is the strongest signal, so it leads.
     if (completedTask) {
-      lines.push(`You completed *${completedTask}* and posted ${signals} update${signals === 1 ? '' : 's'}, mostly across:`)
+      lines.push(`You completed *${completedTask}* and posted ${signals} update${signals === 1 ? '' : 's'}${sitting}, mostly across:`)
     } else {
-      lines.push(`You posted ${signals} update${signals === 1 ? '' : 's'} across:`)
+      lines.push(`You posted ${signals} update${signals === 1 ? '' : 's'}${sitting} across:`)
     }
     lines.push('')
     for (const p of projects) lines.push(`• ${link(p)} — ${count(p)}`)
