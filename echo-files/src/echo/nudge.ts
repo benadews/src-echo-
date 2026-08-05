@@ -2,7 +2,7 @@ import { echoDb } from './lib/supabase'
 import { teamwork } from './lib/teamwork'
 import { lookupByEmail, sendDm } from './lib/slack'
 import { syncPeopleFromTeamwork } from './roles'
-import { timeQuestion, footer, assertNoPronouns, ProjectLine, FooterItem } from './copy'
+import { timeQuestion, silenceQuestion, footer, assertNoPronouns, ProjectLine, FooterItem } from './copy'
 import { londonDay } from './lib/dates'
 
 const OWN_COMPANY_ID = 119378          // We Take Flight in Teamwork
@@ -91,9 +91,49 @@ async function main() {
       .order('work_date', { ascending: false })
       .limit(1)
 
-    const finding = findings?.[0]
+    let finding = findings?.[0]
+    let text: string
+
     if (!finding) {
-      console.log(`${person.full_name}: nothing to ask about today`)
+      // No time question. Is this person silent altogether? That is the one
+      // case where having nothing to say IS the thing worth saying.
+      const { data: quiet } = await db
+        .from('echo_finding')
+        .select('id, human_summary')
+        .eq('person_id', person.id)
+        .eq('kind', 'silent')
+        .eq('status', 'pending')
+        .order('work_date', { ascending: false })
+        .limit(1)
+
+      const s = quiet?.[0]
+      if (!s) {
+        console.log(`${person.full_name}: nothing to ask about today`)
+        continue
+      }
+      const openTasks = Number((s.human_summary ?? '').match(/with (\d+) open/)?.[1] ?? 0)
+      text = silenceQuestion({
+        days: cfg.data?.silence_days ?? 7,
+        openTasks,
+        teamworkBase: TW,
+      })
+      text += await buildFooter(db, person.id, cfg.data?.footer_max_items ?? 3)
+      assertNoPronouns(text)
+
+      if (dryRun) {
+        console.log(`\n--- would send to ${person.full_name} (silence) ---\n${text}\n`)
+        continue
+      }
+      const ts = await sendDm(slackId, text)
+      const ins = await db.from('echo_nudge').insert({
+        person_id: person.id, channel: 'slack_dm', finding_ids: [s.id],
+        slack_ts: ts, slack_channel: slackId,
+      })
+      if (!ins.error) {
+        await db.from('echo_finding').update({ status: 'notified' }).eq('id', s.id)
+        sent++
+        console.log(`${person.full_name}: sent (silence)`)
+      }
       continue
     }
 
@@ -121,7 +161,7 @@ async function main() {
       ? (finding.human_summary ?? '').replace(/^Completed\s+/i, '').split(',')[0] || null
       : null
 
-    let text = timeQuestion({
+    text = timeQuestion({
       completedTask: completed,
       signals: finding.evidence_count as number,
       projects: lines,
