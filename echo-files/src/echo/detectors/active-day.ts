@@ -128,28 +128,44 @@ export async function detectActiveDays(
     const ranked = [...byProject.entries()].sort((a, b) => b[1].length - a[1].length)
     const hash = hashOf(rows.map((r) => r.source_item_id).sort())
 
+    // Select-then-insert rather than upsert with on_conflict. The idempotency
+    // guard in the schema is an EXPRESSION index (it wraps teamwork_task_id in
+    // coalesce), and PostgREST cannot target an expression index with
+    // on_conflict — it errors with 42P10. That error was being swallowed, which
+    // is why the first run reported 28 candidates and 0 findings raised.
+    const existing = await db
+      .from('echo_finding')
+      .select('id')
+      .eq('person_id', personId)
+      .eq('work_date', day)
+      .eq('kind', kind)
+      .eq('evidence_hash', hash)
+      .maybeSingle()
+    if (existing.data) continue
+
     const { data: finding, error } = await db
       .from('echo_finding')
-      .upsert(
-        {
-          person_id: personId,
-          kind,
-          work_date: day,
-          logged_minutes: minsToday,
-          evidence_count: rows.length,
-          project_count: byProject.size,
-          has_completed_task: completed.length > 0,
-          role_class_at_detect: person.role_class,
-          evidence_hash: hash,
-          confidence,
-          human_summary: summarise(rows.length, completed, ranked.length),
-        },
-        { onConflict: 'person_id,work_date,kind,teamwork_task_id,evidence_hash', ignoreDuplicates: true },
-      )
+      .insert({
+        person_id: personId,
+        kind,
+        work_date: day,
+        logged_minutes: minsToday,
+        evidence_count: rows.length,
+        project_count: byProject.size,
+        has_completed_task: completed.length > 0,
+        role_class_at_detect: person.role_class,
+        evidence_hash: hash,
+        confidence,
+        human_summary: summarise(rows.length, completed, ranked.length),
+      })
       .select('id')
       .maybeSingle()
 
-    if (error || !finding) continue
+    if (error) {
+      console.error(`finding insert failed for ${person.full_name} ${day}: ${error.message}`)
+      continue
+    }
+    if (!finding) continue
     raised++
 
     // The ranked project breakdown IS the content of the nudge.
@@ -167,10 +183,10 @@ export async function detectActiveDays(
       }
     })
     for (const c of chunks(kids, 200)) {
-      await db.from('echo_finding_project').upsert(
-        c.map(({ session_count, ...rest }) => rest),
-        { onConflict: 'finding_id,teamwork_project_id', ignoreDuplicates: true },
-      )
+      const r = await db
+        .from('echo_finding_project')
+        .insert(c.map(({ session_count, ...rest }) => rest))
+      if (r.error) console.error(`finding_project insert failed: ${r.error.message}`)
     }
   }
   return { evaluated, raised, suppressed }
