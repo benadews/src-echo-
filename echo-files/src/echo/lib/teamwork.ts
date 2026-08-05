@@ -55,12 +55,18 @@ export interface Person {
   timezone: string | null
 }
 
+export interface Project {
+  id: number
+  name: string
+}
+
 export interface TeamworkApi {
   activities(opts: { start: string; end: string }): Promise<Activity[]>
   timelogs(opts: { start: string; end: string }): Promise<Timelog[]>
   openTasks(): Promise<Task[]>
   task(id: number): Promise<Task>
   people(): Promise<Person[]>
+  projects(): Promise<Project[]>
 }
 
 const BASE = process.env.TEAMWORK_BASE_URL ?? 'https://wetakeflight.eu.teamwork.com'
@@ -129,4 +135,6 @@ export const teamwork: TeamworkApi = {
     tw<{ task: Task }>(`/projects/api/v3/tasks/${id}.json`, {}).then((r) => r.task),
   people: () =>
     pageAll<Person>('/projects/api/v3/people.json', 'people', { type: 'account' }),
+  projects: () =>
+    pageAll<Project>('/projects/api/v3/projects.json', 'projects', {}),
 }
