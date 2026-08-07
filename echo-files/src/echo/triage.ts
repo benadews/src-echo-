@@ -39,31 +39,19 @@ interface TaskCandidate {
  * end of the channel's loop iteration as an earlier version did.
  * echo_triage_finding.channel_id has a foreign key against echo_channel_scan,
  * so a channel's first-ever scan could never successfully write a finding
- * under the old ordering; every insert failed silently mid-run and no DM
- * ever went out, while the checkpoint still advanced — meaning those
- * conversations would have been skipped forever without a manual reset.
+ * under the old ordering.
  *
  * Message copy follows copy.ts's conventions (bold headline + emoji, Slack
  * markdown links, assertNoPronouns) rather than a separate style. Channel is
- * always referenced via Slack's own <#channelId> auto-link — real data, no
- * separate name lookup, present even if the permalink call fails.
+ * always referenced via Slack's own <#channelId> auto-link.
  *
  * Participants are the actual message authors (msg.user on each Slack
- * message) matched against echo_person — NOT an AI guess. The model has no
- * way to know a real Slack ID unless it's a literal <@U123> mention in the
- * text, so asking it to invent one always produced "unknown."
+ * message) matched against echo_person — NOT an AI guess.
  *
- * TESTING PHASE: all findings go only to TESTING_RECIPIENT_EMAIL (Ben),
- * resolved via profiles.role = super_admin -> matched to echo_person by
- * email for a working Slack ID. Chris is super_admin too but deliberately
- * excluded from DMs for now per Ben's instruction — remove the
- * TESTING_RECIPIENT_EMAIL filter below to restore DMs to all super_admins,
- * and swap `superAdmins` for `peopleInvolved` in the send loop to restore
- * direct-to-participant DMs once ready for the wider team.
+ * TESTING PHASE: all findings go only to TESTING_RECIPIENT_EMAIL (Ben).
  *
  * Two cost/noise guards:
- *  - A channel's first-ever scan is bounded to FIRST_SCAN_LOOKBACK_DAYS
- *    rather than full history.
+ *  - A channel's first-ever scan is bounded to FIRST_SCAN_LOOKBACK_DAYS.
  *  - A channel whose most recent message is older than DORMANT_AFTER_DAYS
  *    is skipped entirely for the run, re-checked fresh every time.
  *
@@ -180,10 +168,6 @@ async function main() {
         continue
       }
 
-      // CRITICAL: create/update the checkpoint row NOW, before any finding
-      // for this channel is inserted. echo_triage_finding.channel_id has a
-      // foreign key against this table — without this row existing first,
-      // a channel's first-ever scan can never write a finding successfully.
       const { error: checkpointErr } = await db.from('echo_channel_scan').upsert({
         channel_id: channel.id,
         channel_name: channel.name,
@@ -265,3 +249,240 @@ async function main() {
 
         const authorIds = [...new Set(convo.messages.map((m) => m.user).filter((u): u is string => Boolean(u)))]
         const peopleInvolved = authorIds
+          .map((slackId) => staffBySlackId.get(slackId))
+          .filter((p): p is NonNullable<typeof p> => Boolean(p))
+
+        if (!dryRun) {
+          const ins = await db.from('echo_triage_finding').insert({
+            channel_id: convo.channelId,
+            channel_name: convo.channelName,
+            thread_ts: convo.threadTs,
+            slack_permalink: permalink,
+            summary: result.summary,
+            verdict,
+            confidence: result.confidence,
+            teamwork_project_id: teamworkMatch?.projectId ?? null,
+            teamwork_task_id: teamworkMatch?.taskId ?? null,
+            teamwork_task_url: teamworkTaskUrl,
+            people_involved: peopleInvolved.map((p) => ({ slack_user_id: p.slack_user_id, echo_person_id: p.id, dmd_at: null })),
+          })
+          if (ins.error) {
+            console.error(`  could not write finding: ${ins.error.message}`)
+            continue
+          }
+          findingsWritten++
+        } else {
+          console.log(`\n--- would flag (${verdict}, ${result.confidence}) ---\n${result.summary}\n`)
+        }
+
+        const text = buildTriageMessage({
+          verdict,
+          channelId: convo.channelId,
+          summary: result.summary,
+          taskUrl: teamworkTaskUrl,
+          taskName: teamworkMatch?.taskName ?? null,
+          permalink,
+          involvedNames: peopleInvolved.map((p) => p.full_name),
+        })
+        assertNoPronouns(text)
+
+        for (const admin of superAdmins) {
+          if (!admin.slack_user_id) continue
+          if (dryRun) {
+            console.log(`--- would DM ${admin.full_name} ---\n${text}\n`)
+            continue
+          }
+          try {
+            await sendDm(admin.slack_user_id, text)
+            dmsSent++
+          } catch (err) {
+            console.error(`  DM to ${admin.full_name} failed: ${err instanceof Error ? err.message : err}`)
+          }
+        }
+      }
+
+      const newestTs = messages.reduce((max, m) => (m.ts > max ? m.ts : max), since)
+      if (!dryRun) {
+        await db.from('echo_channel_scan').upsert({
+          channel_id: channel.id,
+          channel_name: channel.name,
+          is_external: channel.is_ext_shared,
+          last_scanned_ts: newestTs,
+          last_run_at: new Date().toISOString(),
+        })
+      }
+    }
+
+    console.log(JSON.stringify(
+      { channelsScanned: channels.length, dormantSkipped, conversationsFound, classified, findingsWritten, dmsSent },
+      null, 2,
+    ))
+
+    if (runId) {
+      await db.from('echo_run').update({
+        finished_at: new Date().toISOString(),
+        ok: true,
+        evidence_ingested: conversationsFound,
+        findings_created: findingsWritten,
+        nudges_sent: dmsSent,
+      }).eq('id', runId)
+    }
+  } catch (err) {
+    if (runId) {
+      try {
+        await db.from('echo_run').update({ finished_at: new Date().toISOString(), ok: false, error: String(err) }).eq('id', runId)
+      } catch {
+        console.error('(could not record the failure in echo_run)')
+      }
+    }
+    throw err
+  }
+}
+
+async function classifyConversation(convo: Conversation): Promise<Classification> {
+  const transcript = convo.messages.map((m) => `${m.user ?? 'unknown'}: ${m.text}`).join('\n')
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': ANTHROPIC_API_KEY!,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: ANTHROPIC_MODEL,
+      max_tokens: 300,
+      system:
+        'You classify Slack conversations from a Shopify agency to spot task-specific work discussion — ' +
+        'e.g. a client asking for a change, a bug being discussed, work being agreed — as opposed to general ' +
+        'chat, banter, scheduling, or internal admin. Respond with ONLY a JSON object, no prose, no markdown fences: ' +
+        '{"isTaskSpecific": boolean, "confidence": "high"|"medium"|"low", "summary": string (one sentence, plain English), ' +
+        '"likelyProjectOrClient": string|null}. ' +
+        'Do not attempt to identify who is speaking — only judge the content. ' +
+        'Be conservative: mark confidence "low" for anything ambiguous rather than guessing.',
+      messages: [{ role: 'user', content: transcript }],
+    }),
+  })
+  if (!res.ok) throw new Error(`Anthropic API ${res.status}: ${await res.text()}`)
+  const data = await res.json()
+  const text = data.content?.[0]?.text ?? '{}'
+  return JSON.parse(text.replace(/```json|```/g, '').trim())
+}
+
+function findMatchingTask(
+  tasks: Task[],
+  projectNames: Map<number, string>,
+  summary: string,
+  projectHint: string | null,
+): TaskCandidate | null {
+  const summaryWords = significantWords(summary)
+  const hintWords = projectHint ? significantWords(projectHint) : []
+
+  let best: { task: Task; score: number } | null = null
+
+  for (const task of tasks) {
+    const taskWords = significantWords(task.name)
+    const projName = task.projectId != null ? projectNames.get(task.projectId) ?? '' : ''
+    const projWords = significantWords(projName)
+
+    let score = overlapCount(summaryWords, taskWords)
+    if (hintWords.length && overlapCount(hintWords, projWords) > 0) score += 3
+
+    if (score > 0 && (!best || score > best.score)) best = { task, score }
+  }
+
+  if (!best || best.score < 2) return null
+
+  return {
+    projectId: best.task.projectId,
+    taskId: best.task.id,
+    taskName: best.task.name,
+    projectName: best.task.projectId != null ? projectNames.get(best.task.projectId) ?? null : null,
+    updatedAt: best.task.updatedAt,
+  }
+}
+
+function significantWords(text: string): string[] {
+  const stop = new Set(['the', 'a', 'an', 'and', 'or', 'for', 'to', 'of', 'in', 'on', 'is', 'are', 'this', 'that', 'with'])
+  return text.toLowerCase().match(/[a-z0-9]+/g)?.filter((w) => w.length > 2 && !stop.has(w)) ?? []
+}
+
+function overlapCount(a: string[], b: string[]): number {
+  const setB = new Set(b)
+  return a.filter((w) => setB.has(w)).length
+}
+
+async function assessStaleness(
+  db: ReturnType<typeof echoDb>,
+  taskId: number,
+  fallbackUpdatedAt: string,
+): Promise<'task_current' | 'task_stale'> {
+  const { data, error } = await db
+    .from('echo_v_stale_tasks')
+    .select('teamwork_task_id')
+    .eq('teamwork_task_id', taskId)
+    .limit(1)
+    .maybeSingle()
+
+  if (error) {
+    console.error(`  could not check echo_v_stale_tasks for task ${taskId}: ${error.message}`)
+    const daysSince = (Date.now() - new Date(fallbackUpdatedAt).getTime()) / 86_400_000
+    return daysSince > 14 ? 'task_stale' : 'task_current'
+  }
+
+  return data ? 'task_stale' : 'task_current'
+}
+
+function buildTriageMessage(opts: {
+  verdict: string
+  channelId: string
+  summary: string
+  taskUrl: string | null
+  taskName: string | null
+  permalink: string | null
+  involvedNames: string[]
+}): string {
+  const { verdict, channelId, summary, taskUrl, taskName, permalink, involvedNames } = opts
+  const lines: string[] = []
+
+  if (verdict === 'no_task_exists') {
+    lines.push(`*Possible task gap spotted* 🔍`)
+    lines.push('')
+    lines.push(`In <#${channelId}>:`)
+    lines.push(summary)
+    lines.push('')
+    lines.push('Worth creating a task for this, or is it already covered somewhere?')
+  } else {
+    lines.push(`*Task hasn't moved in a while* 🕓`)
+    lines.push('')
+    lines.push(`In <#${channelId}>:`)
+    lines.push(summary)
+    if (taskUrl && taskName) {
+      lines.push('')
+      lines.push(`<${taskUrl}|*${taskName}*>`)
+    }
+  }
+
+  if (permalink) {
+    lines.push('')
+    lines.push(`_<${permalink}|View the conversation>_`)
+  }
+
+  if (involvedNames.length) {
+    lines.push('')
+    lines.push(`_Involved: ${involvedNames.join(', ')}_`)
+  }
+
+  return lines.join('\n')
+}
+
+function slackTsFromDaysAgo(days: number): string {
+  return (Date.now() / 1000 - days * 86_400).toFixed(6)
+}
+
+main().catch((e) => {
+  console.error('\n=== TRIAGE FAILED ===')
+  console.error(e instanceof Error ? e.message : e)
+  if (e instanceof Error && e.stack) console.error(e.stack.split('\n').slice(1, 4).join('\n'))
+  process.exit(1)
+})
