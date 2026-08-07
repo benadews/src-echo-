@@ -1,13 +1,16 @@
 name: echo-nudge
-
 on:
+  schedule:
+    - cron: '0 8 * * 1-5'
   workflow_dispatch:
     inputs:
       dry_run:
         description: 'Preview only'
         type: boolean
         default: true
-
+concurrency:
+  group: echo-nudge
+  cancel-in-progress: false
 jobs:
   nudge:
     runs-on: ubuntu-latest
@@ -17,29 +20,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: Show layout
-        run: |
-          echo "--- package.json files ---"
-          find . -name package.json -not -path '*/node_modules/*'
-          echo "--- nudge.ts files ---"
-          find . -name 'nudge.ts' -not -path '*/node_modules/*'
-          echo "--- which ones have the fix ---"
-          for f in $(find . -name 'nudge.ts' -not -path '*/node_modules/*'); do
-            if grep -q stage_history "$f"; then echo "FIXED   $f"; else echo "OLD     $f"; fi
-          done
-          echo "--- chosen by the old rule ---"
-          dirname "$(find . -name package.json -not -path '*/node_modules/*' | head -1)"
-
       - name: Locate project
         id: find
         run: |
           DIR=$(dirname "$(find . -name package.json -not -path '*/node_modules/*' | head -1)")
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
-
       - run: npm install
         working-directory: ${{ steps.find.outputs.dir }}
-
       - run: npx tsx src/echo/nudge.ts
         working-directory: ${{ steps.find.outputs.dir }}
         env:
