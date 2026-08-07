@@ -1,143 +1,104 @@
-/**
- * Minimal Teamwork client for Echo.
- *
- * If Victor already exposes a client with a rate limiter, delete the fetch
- * implementation below and pass Victor's in — everything downstream only needs
- * the `TeamworkApi` interface.
- */
+/** Minimal Slack client. Bot token only — no user tokens, no OAuth dance. */
+const API = 'https://slack.com/api'
 
-export interface Activity {
-  id: number
-  userId: number | null
-  projectId: number | null
-  itemId: number | null
-  type: string
-  activityType: string
-  dateTime: string
-  description: string | null
-  extraDescription: string | null
-  link: string | null
-  meta?: { notifiedUserIds?: number[] } | null
-}
-
-export interface Timelog {
-  id: number
-  userId: number
-  projectId: number | null
-  taskId: number | null
-  minutes: number
-  description: string | null
-  isBillable: boolean
-  isLocked: boolean
-  timeLogged: string
-  createdAt: string
-}
-
-export interface Task {
-  id: number
-  name: string
-  estimateMinutes: number | null
-  updatedAt: string
-  assignees?: { id: number }[]
-  workflowStages?: { stageId: number; workflowId: number }[]
-}
-
-export interface Person {
-  id: number
-  firstName: string
-  lastName: string
-  email: string | null
-  /** Teamwork's own client/guest flag. More trustworthy than any mapping we
-   *  maintain: PJ Holdsworth is isClientUser true with a @muffle.co.uk address. */
-  isClientUser: boolean
-  isServiceAccount: boolean
-  companyId: number
-  timezone: string | null
-}
-
-export interface Project {
-  id: number
-  name: string
-}
-
-export interface TeamworkApi {
-  activities(opts: { start: string; end: string }): Promise<Activity[]>
-  timelogs(opts: { start: string; end: string }): Promise<Timelog[]>
-  openTasks(): Promise<Task[]>
-  task(id: number): Promise<Task>
-  people(): Promise<Person[]>
-  projects(): Promise<Project[]>
-}
-
-const BASE = process.env.TEAMWORK_BASE_URL ?? 'https://wetakeflight.eu.teamwork.com'
-
-async function tw<T>(path: string, params: Record<string, string | number>): Promise<T> {
-  const token = process.env.TEAMWORK_API_TOKEN
-  if (!token) throw new Error('TEAMWORK_API_TOKEN is required')
-  const qs = new URLSearchParams(
-    Object.entries(params).map(([k, v]) => [k, String(v)]),
-  )
-  const res = await fetch(`${BASE}${path}?${qs}`, {
+async function slack<T>(method: string, body: unknown): Promise<T> {
+  const token = process.env.SLACK_BOT_TOKEN
+  if (!token) throw new Error('SLACK_BOT_TOKEN is required')
+  const res = await fetch(`${API}/${method}`, {
+    method: 'POST',
     headers: {
-      Authorization: `Basic ${Buffer.from(`${token}:x`).toString('base64')}`,
-      Accept: 'application/json',
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json; charset=utf-8',
     },
+    body: JSON.stringify(body),
   })
-  if (res.status === 429) {
-    const wait = Number(res.headers.get('retry-after') ?? 5)
-    await new Promise((r) => setTimeout(r, wait * 1000))
-    return tw<T>(path, params)
-  }
-  if (!res.ok) throw new Error(`Teamwork ${path} -> ${res.status} ${await res.text()}`)
-  return (await res.json()) as T
+  const json = (await res.json()) as { ok: boolean; error?: string } & T
+  if (!json.ok) throw new Error(`Slack ${method} failed: ${json.error}`)
+  return json
 }
 
-/**
- * Pages until exhausted.
- *
- * NOTE on activities: the server-side date filter is NOT reliable — a query
- * scoped to 4 August returns events stamped 5 August (verified against the live
- * account). Callers must filter on `dateTime` themselves. The date params are
- * still passed to bound the amount of paging, not to trust the result.
- */
-async function pageAll<T>(
-  path: string,
-  key: string,
-  params: Record<string, string | number>,
-): Promise<T[]> {
-  const out: T[] = []
-  for (let page = 1; page <= 200; page++) {
-    const body = await tw<Record<string, unknown>>(path, { ...params, page, pageSize: 250 })
-    const rows = (body[key] ?? []) as T[]
-    out.push(...rows)
-    const meta = body.meta as { page?: { hasMore?: boolean } } | undefined
-    if (!meta?.page?.hasMore) break
+/** Resolve a Slack user by email. Requires the users:read.email scope. */
+export async function lookupByEmail(email: string): Promise<string | null> {
+  try {
+    const r = await slack<{ user: { id: string } }>('users.lookupByEmail', { email })
+    return r.user.id
+  } catch {
+    return null // not found, or a different address in Slack
   }
-  return out
 }
 
-export const teamwork: TeamworkApi = {
-  activities: ({ start, end }) =>
-    pageAll<Activity>('/projects/api/v3/latestactivity.json', 'activities', {
-      startDate: start,
-      endDate: end,
-    }),
-  timelogs: ({ start, end }) =>
-    pageAll<Timelog>('/projects/api/v3/time.json', 'timelogs', {
-      startDate: start,
-      endDate: end,
-    }),
-  openTasks: () =>
-    pageAll<Task>('/projects/api/v3/tasks.json', 'tasks', {
-      includeCompletedTasks: 'false',
-      projectStatus: 'active', // excludes tasks sitting in archived projects — unverified param name, check the log line after running
-    }),
-  task: (id) =>
-    tw<{ task: Task }>(`/projects/api/v3/tasks/${id}.json`, {}).then((r) => r.task),
-  people: () =>
-    pageAll<Person>('/projects/api/v3/people.json', 'people', { type: 'account' }),
-  projects: () =>
-    pageAll<Project>('/projects/api/v3/projects.json', 'projects', {
-      status: 'active', // excludes archived projects from matching
-    }),
+/** DM a user. Passing a user id as `channel` opens the DM implicitly. */
+export async function sendDm(userId: string, text: string): Promise<string> {
+  const r = await slack<{ ts: string }>('chat.postMessage', {
+    channel: userId,
+    text,
+    unfurl_links: false,
+    unfurl_media: false,
+  })
+  return r.ts
+}
+
+/** List every channel the bot is a member of — public, private, and Slack Connect. */
+export async function listBotChannels(): Promise<Array<{ id: string; name: string; is_private: boolean; is_ext_shared: boolean }>> {
+  const channels: Array<{ id: string; name: string; is_private: boolean; is_ext_shared: boolean }> = []
+  let cursor: string | undefined
+  do {
+    const r = await slack<{ channels: typeof channels; response_metadata?: { next_cursor?: string } }>(
+      'conversations.list',
+      { types: 'public_channel,private_channel', exclude_archived: true, limit: 200, cursor },
+    )
+    channels.push(...r.channels)
+    cursor = r.response_metadata?.next_cursor || undefined
+  } while (cursor)
+  return channels
+}
+
+/** Timestamp of the single most recent message in a channel, or null if empty.
+ *  Cheap check used to skip dormant channels before pulling full history. */
+export async function getLatestMessageTs(channelId: string): Promise<string | null> {
+  const r = await slack<{ messages: Array<{ ts: string }> }>('conversations.history', {
+    channel: channelId,
+    limit: 1,
+  })
+  return r.messages[0]?.ts ?? null
+}
+
+/** New top-level messages in a channel since a given ts (exclusive). */
+export async function getHistorySince(
+  channelId: string,
+  oldestTs: string | null,
+): Promise<Array<{ ts: string; user?: string; text: string; thread_ts?: string; reply_count?: number }>> {
+  const messages: Array<{ ts: string; user?: string; text: string; thread_ts?: string; reply_count?: number }> = []
+  let cursor: string | undefined
+  do {
+    const r = await slack<{ messages: typeof messages; has_more: boolean; response_metadata?: { next_cursor?: string } }>(
+      'conversations.history',
+      { channel: channelId, oldest: oldestTs ?? undefined, limit: 200, cursor },
+    )
+    messages.push(...r.messages)
+    cursor = r.has_more ? r.response_metadata?.next_cursor : undefined
+  } while (cursor)
+  return messages
+}
+
+/** All replies in a thread, including the parent message. */
+export async function getThreadReplies(
+  channelId: string,
+  threadTs: string,
+): Promise<Array<{ ts: string; user?: string; text: string }>> {
+  const r = await slack<{ messages: Array<{ ts: string; user?: string; text: string }> }>(
+    'conversations.replies',
+    { channel: channelId, ts: threadTs, limit: 200 },
+  )
+  return r.messages
+}
+
+/** A clickable link back to the exact message, for the dashboard and any DM. */
+export async function getPermalink(channelId: string, messageTs: string): Promise<string | null> {
+  try {
+    const r = await slack<{ permalink: string }>('chat.getPermalink', { channel: channelId, message_ts: messageTs })
+    return r.permalink
+  } catch {
+    return null
+  }
 }
