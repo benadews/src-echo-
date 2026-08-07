@@ -1,4 +1,4 @@
-name: echo-triage
+
 on:
   schedule:
     - cron: '30 6 * * 1-5'
