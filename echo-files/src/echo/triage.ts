@@ -330,7 +330,11 @@ async function classifyConversation(convo: Conversation): Promise<Classification
         'Do NOT flag:\n' +
         '- Status updates or logistics ("missing standup," "will be at my desk," "following up soon")\n' +
         '- Mentions that something is scheduled or pending without a concrete ask ("waiting to present to stakeholders")\n' +
-        '- General check-ins or "just letting you know" messages with no decision or commitment attached\n\n' +
+        '- General check-ins or "just letting you know" messages with no decision or commitment attached\n' +
+        '- Comments or feedback on a Teamwork task that ALREADY EXISTS and is simply being discussed — the task being ' +
+        'referenced directly is itself evidence nothing is missing, even if people are still working out the details\n' +
+        '- Internal decisions about how to handle a client (budget, scope, messaging) that produce no new deliverable or ' +
+        'task of their own — these are judgment calls, not work gaps\n\n' +
         'Test: would this conversation, if read alone, tell you EXACTLY what task should be created or updated, and why it ' +
         'matters now? If not, it is not task-specific enough to flag, even if it mentions real project names or people.\n\n' +
         'Respond with ONLY a JSON object, no prose, no markdown fences: ' +
