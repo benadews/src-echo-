@@ -53,6 +53,16 @@ export async function listBotChannels(): Promise<Array<{ id: string; name: strin
   return channels
 }
 
+/** Timestamp of the single most recent message in a channel, or null if empty.
+ *  Cheap check used to skip dormant channels before pulling full history. */
+export async function getLatestMessageTs(channelId: string): Promise<string | null> {
+  const r = await slack<{ messages: Array<{ ts: string }> }>('conversations.history', {
+    channel: channelId,
+    limit: 1,
+  })
+  return r.messages[0]?.ts ?? null
+}
+
 /** New top-level messages in a channel since a given ts (exclusive). */
 export async function getHistorySince(
   channelId: string,
