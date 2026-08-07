@@ -10,13 +10,12 @@ const FIRST_SCAN_LOOKBACK_DAYS = 3 // a channel's first-ever scan only looks bac
 const DORMANT_AFTER_DAYS = 30 // channels silent longer than this are skipped entirely for the run
 
 type SlackMessage = { ts: string; user?: string; text: string; thread_ts?: string; reply_count?: number }
-type Conversation = { channelId: string; channelName: string; threadTs: string; messages: SlackMessage[] }
+type Conversation = { channelId: string; channelName: string; isExternal: boolean; threadTs: string; messages: SlackMessage[] }
 type Classification = {
   isTaskSpecific: boolean
   confidence: 'high' | 'medium' | 'low'
   summary: string
   likelyProjectOrClient: string | null
-  participantsMentioned: string[]
 }
 interface TaskCandidate {
   projectId: number | null
@@ -34,18 +33,21 @@ interface TaskCandidate {
  * has gone stale (reusing sweep's own dwell-breach definition,
  * echo_v_stale_tasks, rather than a separate threshold).
  *
- * TESTING PHASE: all findings are DMed only to super_admins (Vector's
- * profiles.role), tagged with who the conversation was actually about,
- * rather than DMing those participants directly. This is deliberate — Ben
- * wants to review copy/accuracy before this reaches the wider team. To
- * restore direct DMs to participants once ready, see the clearly marked
- * block below.
+ * Message copy follows copy.ts's conventions (bold headline + emoji, Slack
+ * markdown links, assertNoPronouns) rather than a separate style. Channel is
+ * always referenced via Slack's own <#channelId> auto-link — real data, no
+ * separate name lookup, present even if the permalink call fails.
  *
- * super_admin status comes from Vector's `profiles` table, but the actual
- * Slack ID used to send the DM comes from `echo_person` (matched by email)
- * — echo_person.slack_user_id is the one we know is reliably populated,
- * since sweep/nudge depend on it daily. profiles.slack_user_id may not be
- * populated at all.
+ * Participants are the actual message authors (msg.user on each Slack
+ * message) matched against echo_person — NOT an AI guess. The model has no
+ * way to know a real Slack ID unless it's a literal <@U123> mention in the
+ * text, so asking it to invent one always produced "unknown."
+ *
+ * TESTING PHASE: all findings are DMed only to super_admins (Vector's
+ * profiles.role, resolved to a Slack ID via echo_person by email — profiles
+ * itself may not have slack_user_id populated), tagged with who was actually
+ * in the conversation. To restore direct DMs to those participants once
+ * ready, see the clearly marked block below.
  *
  * Two cost/noise guards:
  *  - A channel's first-ever scan is bounded to FIRST_SCAN_LOOKBACK_DAYS
@@ -80,10 +82,6 @@ async function main() {
     const staffBySlackId = new Map((staff ?? []).filter((p) => p.slack_user_id).map((p) => [p.slack_user_id as string, p]))
     const staffByEmail = new Map((staff ?? []).filter((p) => p.email).map((p) => [p.email!.toLowerCase(), p]))
 
-    // Who to notify while in testing phase: super_admin status comes from
-    // Vector's profiles table, but we resolve their Slack ID via echo_person
-    // (matched by email) rather than trusting profiles.slack_user_id, which
-    // may not be populated.
     const { data: superAdminProfiles, error: adminErr } = await db
       .from('profiles')
       .select('id, full_name, email')
@@ -196,7 +194,13 @@ async function main() {
             // fall back to just the parent message
           }
         }
-        conversations.push({ channelId: channel.id, channelName: channel.name, threadTs: msg.ts, messages: thread })
+        conversations.push({
+          channelId: channel.id,
+          channelName: channel.name,
+          isExternal: channel.is_ext_shared,
+          threadTs: msg.ts,
+          messages: thread,
+        })
       }
       conversationsFound += conversations.length
 
@@ -227,9 +231,19 @@ async function main() {
         if (verdict === 'task_current') continue
 
         const teamworkTaskUrl = teamworkMatch ? `${process.env.TEAMWORK_BASE_URL}/#/tasks/${teamworkMatch.taskId}` : null
-        const permalink = await getPermalink(convo.channelId, convo.threadTs)
 
-        const peopleInvolved = result.participantsMentioned
+        let permalink: string | null = null
+        try {
+          permalink = await getPermalink(convo.channelId, convo.threadTs)
+          if (!permalink) console.warn(`  ${channel.name} thread ${convo.threadTs}: getPermalink returned no link`)
+        } catch (err) {
+          console.warn(`  ${channel.name} thread ${convo.threadTs}: permalink fetch failed — ${err instanceof Error ? err.message : err}`)
+        }
+
+        // Real participants: actual Slack authors on the thread, not an AI
+        // guess. Slack already tells us who wrote each message.
+        const authorIds = [...new Set(convo.messages.map((m) => m.user).filter((u): u is string => Boolean(u)))]
+        const peopleInvolved = authorIds
           .map((slackId) => staffBySlackId.get(slackId))
           .filter((p): p is NonNullable<typeof p> => Boolean(p))
 
@@ -258,16 +272,22 @@ async function main() {
 
         // TESTING PHASE: DM super_admins only, not the conversation
         // participants directly. To restore direct-to-participant DMs once
-        // ready, replace `superAdmins` with `peopleInvolved` below and drop
-        // the "would normally go to" line.
-        const involvedNames = peopleInvolved.map((p) => p.full_name).join(', ') || 'unknown'
+        // ready, replace `superAdmins` with `peopleInvolved` below.
+        const text = buildTriageMessage({
+          verdict,
+          channelId: convo.channelId,
+          summary: result.summary,
+          taskUrl: teamworkTaskUrl,
+          taskName: teamworkMatch?.taskName ?? null,
+          permalink,
+          involvedNames: peopleInvolved.map((p) => p.full_name),
+        })
+        assertNoPronouns(text)
+
         for (const admin of superAdmins) {
           if (!admin.slack_user_id) continue
-          const text = buildTriageMessage(verdict, result.summary, teamworkTaskUrl, permalink)
-            + `\n(Would normally go to: ${involvedNames})`
-          assertNoPronouns(text)
           if (dryRun) {
-            console.log(`--- would DM ${admin.full_name} (on behalf of ${involvedNames}) ---\n${text}\n`)
+            console.log(`--- would DM ${admin.full_name} ---\n${text}\n`)
             continue
           }
           try {
@@ -329,13 +349,14 @@ async function classifyConversation(convo: Conversation): Promise<Classification
     },
     body: JSON.stringify({
       model: ANTHROPIC_MODEL,
-      max_tokens: 400,
+      max_tokens: 300,
       system:
         'You classify Slack conversations from a Shopify agency to spot task-specific work discussion — ' +
         'e.g. a client asking for a change, a bug being discussed, work being agreed — as opposed to general ' +
         'chat, banter, scheduling, or internal admin. Respond with ONLY a JSON object, no prose, no markdown fences: ' +
         '{"isTaskSpecific": boolean, "confidence": "high"|"medium"|"low", "summary": string (one sentence, plain English), ' +
-        '"likelyProjectOrClient": string|null, "participantsMentioned": string[] (Slack user IDs of people actually doing/requesting the work, not just present)}. ' +
+        '"likelyProjectOrClient": string|null}. ' +
+        'Do not attempt to identify who is speaking — only judge the content. ' +
         'Be conservative: mark confidence "low" for anything ambiguous rather than guessing.',
       messages: [{ role: 'user', content: transcript }],
     }),
@@ -410,18 +431,52 @@ async function assessStaleness(
   return data ? 'task_stale' : 'task_current'
 }
 
-function buildTriageMessage(verdict: string, summary: string, taskUrl: string | null, slackPermalink: string | null): string {
+/**
+ * Matches copy.ts's conventions: bold headline + emoji, Slack markdown links,
+ * blank-line spacing. <#channelId> is Slack's own auto-link syntax — always
+ * present, no separate name lookup, no dependency on the permalink call
+ * succeeding.
+ */
+function buildTriageMessage(opts: {
+  verdict: string
+  channelId: string
+  summary: string
+  taskUrl: string | null
+  taskName: string | null
+  permalink: string | null
+  involvedNames: string[]
+}): string {
+  const { verdict, channelId, summary, taskUrl, taskName, permalink, involvedNames } = opts
   const lines: string[] = []
+
   if (verdict === 'no_task_exists') {
-    lines.push(`Spotted a conversation that sounds like work with no matching task in Teamwork:`)
+    lines.push(`*Possible task gap spotted* 🔍`)
+    lines.push('')
+    lines.push(`In <#${channelId}>:`)
     lines.push(summary)
-    lines.push(`Worth creating a task for this, or is it already covered somewhere I've missed?`)
+    lines.push('')
+    lines.push('Worth creating a task for this, or is it already covered somewhere?')
   } else {
-    lines.push(`Spotted a conversation about a task that hasn't been updated in a while:`)
+    lines.push(`*Task hasn't moved in a while* 🕓`)
+    lines.push('')
+    lines.push(`In <#${channelId}>:`)
     lines.push(summary)
-    if (taskUrl) lines.push(taskUrl)
+    if (taskUrl && taskName) {
+      lines.push('')
+      lines.push(`<${taskUrl}|*${taskName}*>`)
+    }
   }
-  if (slackPermalink) lines.push(`Original conversation: ${slackPermalink}`)
+
+  if (permalink) {
+    lines.push('')
+    lines.push(`_<${permalink}|View the conversation>_`)
+  }
+
+  if (involvedNames.length) {
+    lines.push('')
+    lines.push(`_Involved: ${involvedNames.join(', ')}_`)
+  }
+
   return lines.join('\n')
 }
 
