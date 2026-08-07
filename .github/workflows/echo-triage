@@ -1,0 +1,39 @@
+name: echo-triage
+on:
+  schedule:
+    - cron: '30 6 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview only — classify and match, send nothing, write nothing'
+        type: boolean
+        default: true
+concurrency:
+  group: echo-triage
+  cancel-in-progress: false
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Locate project
+        id: find
+        run: |
+          DIR=$(dirname "$(find . -name package.json -not -path '*/node_modules/*' | head -1)")
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+      - run: npm install
+        working-directory: ${{ steps.find.outputs.dir }}
+      - run: npx tsx src/echo/triage.ts
+        working-directory: ${{ steps.find.outputs.dir }}
+        env:
+          ECHO_DRY_RUN: ${{ inputs.dry_run }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEAMWORK_API_TOKEN: ${{ secrets.TEAMWORK_API_TOKEN }}
+          TEAMWORK_BASE_URL: ${{ secrets.TEAMWORK_BASE_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
