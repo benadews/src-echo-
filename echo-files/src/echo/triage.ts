@@ -5,10 +5,10 @@ import { assertNoPronouns } from './copy'
 import { londonDay } from './lib/dates'
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
-const ANTHROPIC_MODEL = 'claude-sonnet-4-5' // confirm against whatever Vector's brief analyser uses
-const FIRST_SCAN_LOOKBACK_DAYS = 3 // a channel's first-ever scan only looks back this far, not full history
-const DORMANT_AFTER_DAYS = 30 // channels silent longer than this are skipped entirely for the run
-const TESTING_RECIPIENT_EMAIL = 'ben@wetakeflight.co.uk' // TESTING PHASE: only this person gets triage DMs — remove this filter to restore all super_admins
+const ANTHROPIC_MODEL = 'claude-sonnet-4-5'
+const FIRST_SCAN_LOOKBACK_DAYS = 3
+const DORMANT_AFTER_DAYS = 30
+const TESTING_RECIPIENT_EMAIL = 'ben@wetakeflight.co.uk'
 
 type SlackMessage = { ts: string; user?: string; text: string; thread_ts?: string; reply_count?: number }
 type Conversation = { channelId: string; channelName: string; isExternal: boolean; threadTs: string; messages: SlackMessage[] }
@@ -26,37 +26,6 @@ interface TaskCandidate {
   updatedAt: string
 }
 
-/**
- * Echo triage — reads every channel the bot is in (including external/Slack
- * Connect), groups messages into conversations, asks the AI to judge which
- * ones sound like real task-specific work, cross-checks Teamwork, and DMs
- * findings when confident there's a gap — no task exists, or one exists but
- * has gone stale (reusing sweep's own dwell-breach definition,
- * echo_v_stale_tasks, rather than a separate threshold).
- *
- * CRITICAL ORDERING: the echo_channel_scan row for a channel is created
- * immediately, before any finding for that channel is processed — NOT at the
- * end of the channel's loop iteration as an earlier version did.
- * echo_triage_finding.channel_id has a foreign key against echo_channel_scan,
- * so a channel's first-ever scan could never successfully write a finding
- * under the old ordering.
- *
- * Message copy follows copy.ts's conventions (bold headline + emoji, Slack
- * markdown links, assertNoPronouns) rather than a separate style. Channel is
- * always referenced via Slack's own <#channelId> auto-link.
- *
- * Participants are the actual message authors (msg.user on each Slack
- * message) matched against echo_person — NOT an AI guess.
- *
- * TESTING PHASE: all findings go only to TESTING_RECIPIENT_EMAIL (Ben).
- *
- * Two cost/noise guards:
- *  - A channel's first-ever scan is bounded to FIRST_SCAN_LOOKBACK_DAYS.
- *  - A channel whose most recent message is older than DORMANT_AFTER_DAYS
- *    is skipped entirely for the run, re-checked fresh every time.
- *
- * Mirrors sweep.ts's error handling: loud, explicit, never swallowed.
- */
 async function main() {
   const db = echoDb()
   const dryRun = process.env.ECHO_DRY_RUN === 'true'
@@ -353,13 +322,22 @@ async function classifyConversation(convo: Conversation): Promise<Classification
       model: ANTHROPIC_MODEL,
       max_tokens: 300,
       system:
-        'You classify Slack conversations from a Shopify agency to spot task-specific work discussion — ' +
-        'e.g. a client asking for a change, a bug being discussed, work being agreed — as opposed to general ' +
-        'chat, banter, scheduling, or internal admin. Respond with ONLY a JSON object, no prose, no markdown fences: ' +
+        'You classify Slack conversations from a Shopify agency to spot GENUINE task-specific work gaps — ' +
+        'not general work-adjacent chatter. Only flag a conversation if it contains one of these concrete things:\n' +
+        '- A specific resource or time commitment (a named person, a deadline, a piece of work) that should be tracked\n' +
+        '- An assignment or ownership gap that puts a deadline at risk\n' +
+        '- Clear evidence someone is ready to act on a task that Teamwork shows as stale or unclear\n\n' +
+        'Do NOT flag:\n' +
+        '- Status updates or logistics ("missing standup," "will be at my desk," "following up soon")\n' +
+        '- Mentions that something is scheduled or pending without a concrete ask ("waiting to present to stakeholders")\n' +
+        '- General check-ins or "just letting you know" messages with no decision or commitment attached\n\n' +
+        'Test: would this conversation, if read alone, tell you EXACTLY what task should be created or updated, and why it ' +
+        'matters now? If not, it is not task-specific enough to flag, even if it mentions real project names or people.\n\n' +
+        'Respond with ONLY a JSON object, no prose, no markdown fences: ' +
         '{"isTaskSpecific": boolean, "confidence": "high"|"medium"|"low", "summary": string (one sentence, plain English), ' +
         '"likelyProjectOrClient": string|null}. ' +
-        'Do not attempt to identify who is speaking — only judge the content. ' +
-        'Be conservative: mark confidence "low" for anything ambiguous rather than guessing.',
+        'Be conservative: when in doubt, mark isTaskSpecific false rather than low confidence — false negatives are far ' +
+        'cheaper here than noise.',
       messages: [{ role: 'user', content: transcript }],
     }),
   })
