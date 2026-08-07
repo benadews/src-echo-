@@ -29,19 +29,29 @@ interface TaskCandidate {
 /**
  * Echo triage — reads every channel the bot is in (including external/Slack
  * Connect), groups messages into conversations, asks the AI to judge which
- * ones sound like real task-specific work, cross-checks Teamwork, and DMs the
- * staff involved when confident there's a gap — no task exists, or one
- * exists but has gone stale (reusing sweep's own dwell-breach definition,
+ * ones sound like real task-specific work, cross-checks Teamwork, and DMs
+ * findings when confident there's a gap — no task exists, or one exists but
+ * has gone stale (reusing sweep's own dwell-breach definition,
  * echo_v_stale_tasks, rather than a separate threshold).
  *
+ * TESTING PHASE: all findings are DMed only to super_admins (Vector's
+ * profiles.role), tagged with who the conversation was actually about,
+ * rather than DMing those participants directly. This is deliberate — Ben
+ * wants to review copy/accuracy before this reaches the wider team. To
+ * restore direct DMs to participants once ready, see the clearly marked
+ * block below.
+ *
+ * super_admin status comes from Vector's `profiles` table, but the actual
+ * Slack ID used to send the DM comes from `echo_person` (matched by email)
+ * — echo_person.slack_user_id is the one we know is reliably populated,
+ * since sweep/nudge depend on it daily. profiles.slack_user_id may not be
+ * populated at all.
+ *
  * Two cost/noise guards:
- *  - A channel's first-ever scan is bounded to FIRST_SCAN_LOOKBACK_DAYS rather
- *    than full history.
- *  - A channel whose most recent message is older than DORMANT_AFTER_DAYS is
- *    skipped entirely for the run — cheap check (one Slack call) before the
- *    expensive one (full history + AI classification per thread). Re-checked
- *    fresh every run, so a dormant channel that gets a new message is picked
- *    up again automatically rather than staying permanently disabled.
+ *  - A channel's first-ever scan is bounded to FIRST_SCAN_LOOKBACK_DAYS
+ *    rather than full history.
+ *  - A channel whose most recent message is older than DORMANT_AFTER_DAYS
+ *    is skipped entirely for the run, re-checked fresh every time.
  *
  * Mirrors sweep.ts's error handling: loud, explicit, never swallowed.
  */
@@ -64,10 +74,42 @@ async function main() {
   try {
     const { data: staff, error: staffErr } = await db
       .from('echo_person')
-      .select('id, full_name, slack_user_id, is_staff')
+      .select('id, full_name, email, slack_user_id, is_staff')
       .eq('is_staff', true)
     if (staffErr) throw new Error(`Cannot read echo_person: ${staffErr.message}`)
     const staffBySlackId = new Map((staff ?? []).filter((p) => p.slack_user_id).map((p) => [p.slack_user_id as string, p]))
+    const staffByEmail = new Map((staff ?? []).filter((p) => p.email).map((p) => [p.email!.toLowerCase(), p]))
+
+    // Who to notify while in testing phase: super_admin status comes from
+    // Vector's profiles table, but we resolve their Slack ID via echo_person
+    // (matched by email) rather than trusting profiles.slack_user_id, which
+    // may not be populated.
+    const { data: superAdminProfiles, error: adminErr } = await db
+      .from('profiles')
+      .select('id, full_name, email')
+      .eq('role', 'super_admin')
+    if (adminErr) throw new Error(`Cannot read profiles for super_admin: ${adminErr.message}`)
+    if (!superAdminProfiles?.length) throw new Error('No super_admin found in profiles — nobody would receive triage DMs.')
+
+    const superAdmins = superAdminProfiles
+      .map((sa) => {
+        const echoMatch = sa.email ? staffByEmail.get(sa.email.toLowerCase()) : undefined
+        return echoMatch
+          ? { full_name: sa.full_name ?? echoMatch.full_name, slack_user_id: echoMatch.slack_user_id as string | null }
+          : null
+      })
+      .filter((sa): sa is { full_name: string; slack_user_id: string | null } => sa !== null)
+
+    if (!superAdmins.length) {
+      throw new Error(
+        'super_admin(s) found in profiles, but none matched an echo_person by email — ' +
+        'check profiles.email lines up with echo_person.email for Ben/Chris.',
+      )
+    }
+    const missingSlackId = superAdmins.filter((sa) => !sa.slack_user_id)
+    if (missingSlackId.length) {
+      console.warn(`  warning: ${missingSlackId.map((sa) => sa.full_name).join(', ')} matched but has no slack_user_id in echo_person — will be skipped when sending.`)
+    }
 
     console.log('Loading open tasks and projects for matching...')
     const [openTasks, projectList] = await Promise.all([teamwork.openTasks(), teamwork.projects()])
@@ -92,7 +134,6 @@ async function main() {
         .maybeSingle()
       if (checkpoint.error) throw new Error(`Cannot read echo_channel_scan: ${checkpoint.error.message}`)
 
-      // Cheap dormancy check before the expensive full-history fetch.
       let latestTs: string | null
       try {
         latestTs = await getLatestMessageTs(channel.id)
@@ -215,19 +256,25 @@ async function main() {
           console.log(`\n--- would flag (${verdict}, ${result.confidence}) ---\n${result.summary}\n`)
         }
 
-        for (const person of peopleInvolved) {
-          if (!person.slack_user_id) continue
+        // TESTING PHASE: DM super_admins only, not the conversation
+        // participants directly. To restore direct-to-participant DMs once
+        // ready, replace `superAdmins` with `peopleInvolved` below and drop
+        // the "would normally go to" line.
+        const involvedNames = peopleInvolved.map((p) => p.full_name).join(', ') || 'unknown'
+        for (const admin of superAdmins) {
+          if (!admin.slack_user_id) continue
           const text = buildTriageMessage(verdict, result.summary, teamworkTaskUrl, permalink)
+            + `\n(Would normally go to: ${involvedNames})`
           assertNoPronouns(text)
           if (dryRun) {
-            console.log(`--- would DM ${person.full_name} ---\n${text}\n`)
+            console.log(`--- would DM ${admin.full_name} (on behalf of ${involvedNames}) ---\n${text}\n`)
             continue
           }
           try {
-            await sendDm(person.slack_user_id, text)
+            await sendDm(admin.slack_user_id, text)
             dmsSent++
           } catch (err) {
-            console.error(`  DM to ${person.full_name} failed: ${err instanceof Error ? err.message : err}`)
+            console.error(`  DM to ${admin.full_name} failed: ${err instanceof Error ? err.message : err}`)
           }
         }
       }
@@ -342,11 +389,6 @@ function overlapCount(a: string[], b: string[]): number {
   return a.filter((w) => setB.has(w)).length
 }
 
-/**
- * Reuses sweep's own dwell-breach view rather than a separate threshold —
- * "stale" means the same thing everywhere in Echo. Falls back to a generous
- * 14-day recency check only if the view itself can't be read.
- */
 async function assessStaleness(
   db: ReturnType<typeof echoDb>,
   taskId: number,
