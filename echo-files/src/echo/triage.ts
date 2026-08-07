@@ -1,12 +1,13 @@
 import { echoDb } from './lib/supabase'
 import { teamwork, type Task } from './lib/teamwork'
-import { listBotChannels, getHistorySince, getThreadReplies, getPermalink, sendDm } from './lib/slack'
+import { listBotChannels, getHistorySince, getThreadReplies, getPermalink, getLatestMessageTs, sendDm } from './lib/slack'
 import { assertNoPronouns } from './copy'
 import { londonDay } from './lib/dates'
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
 const ANTHROPIC_MODEL = 'claude-sonnet-4-5' // confirm against whatever Vector's brief analyser uses
 const FIRST_SCAN_LOOKBACK_DAYS = 3 // a channel's first-ever scan only looks back this far, not full history
+const DORMANT_AFTER_DAYS = 30 // channels silent longer than this are skipped entirely for the run
 
 type SlackMessage = { ts: string; user?: string; text: string; thread_ts?: string; reply_count?: number }
 type Conversation = { channelId: string; channelName: string; threadTs: string; messages: SlackMessage[] }
@@ -33,10 +34,14 @@ interface TaskCandidate {
  * exists but has gone stale (reusing sweep's own dwell-breach definition,
  * echo_v_stale_tasks, rather than a separate threshold).
  *
- * A channel's first-ever scan is bounded to FIRST_SCAN_LOOKBACK_DAYS rather
- * than full history — without this, day one on an old channel means reading
- * years of messages and classifying all of them, which is slow and burns
- * API credit on conversations long since resolved.
+ * Two cost/noise guards:
+ *  - A channel's first-ever scan is bounded to FIRST_SCAN_LOOKBACK_DAYS rather
+ *    than full history.
+ *  - A channel whose most recent message is older than DORMANT_AFTER_DAYS is
+ *    skipped entirely for the run — cheap check (one Slack call) before the
+ *    expensive one (full history + AI classification per thread). Re-checked
+ *    fresh every run, so a dormant channel that gets a new message is picked
+ *    up again automatically rather than staying permanently disabled.
  *
  * Mirrors sweep.ts's error handling: loud, explicit, never swallowed.
  */
@@ -77,6 +82,7 @@ async function main() {
     let classified = 0
     let findingsWritten = 0
     let dmsSent = 0
+    let dormantSkipped = 0
 
     for (const channel of channels) {
       const checkpoint = await db
@@ -85,6 +91,38 @@ async function main() {
         .eq('channel_id', channel.id)
         .maybeSingle()
       if (checkpoint.error) throw new Error(`Cannot read echo_channel_scan: ${checkpoint.error.message}`)
+
+      // Cheap dormancy check before the expensive full-history fetch.
+      let latestTs: string | null
+      try {
+        latestTs = await getLatestMessageTs(channel.id)
+      } catch (err) {
+        console.error(`  ${channel.name}: latest-message check failed — ${err instanceof Error ? err.message : err}`)
+        continue
+      }
+
+      if (!latestTs) {
+        await db.from('echo_channel_scan').upsert({
+          channel_id: channel.id,
+          channel_name: channel.name,
+          is_external: channel.is_ext_shared,
+          last_run_at: new Date().toISOString(),
+        })
+        continue
+      }
+
+      const daysSinceLastMessage = (Date.now() / 1000 - Number(latestTs)) / 86_400
+      if (daysSinceLastMessage > DORMANT_AFTER_DAYS) {
+        console.log(`  ${channel.name}: dormant (last message ${Math.round(daysSinceLastMessage)} days ago) — skipped`)
+        dormantSkipped++
+        await db.from('echo_channel_scan').upsert({
+          channel_id: channel.id,
+          channel_name: channel.name,
+          is_external: channel.is_ext_shared,
+          last_run_at: new Date().toISOString(),
+        })
+        continue
+      }
 
       const since = checkpoint.data?.last_scanned_ts ?? slackTsFromDaysAgo(FIRST_SCAN_LOOKBACK_DAYS)
 
@@ -206,7 +244,10 @@ async function main() {
       }
     }
 
-    console.log(JSON.stringify({ channelsScanned: channels.length, conversationsFound, classified, findingsWritten, dmsSent }, null, 2))
+    console.log(JSON.stringify(
+      { channelsScanned: channels.length, dormantSkipped, conversationsFound, classified, findingsWritten, dmsSent },
+      null, 2,
+    ))
 
     if (runId) {
       await db.from('echo_run').update({
