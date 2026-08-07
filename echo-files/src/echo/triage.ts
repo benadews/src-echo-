@@ -8,6 +8,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
 const ANTHROPIC_MODEL = 'claude-sonnet-4-5' // confirm against whatever Vector's brief analyser uses
 const FIRST_SCAN_LOOKBACK_DAYS = 3 // a channel's first-ever scan only looks back this far, not full history
 const DORMANT_AFTER_DAYS = 30 // channels silent longer than this are skipped entirely for the run
+const TESTING_RECIPIENT_EMAIL = 'ben@wetakeflight.co.uk' // TESTING PHASE: only this person gets triage DMs — remove this filter to restore all super_admins
 
 type SlackMessage = { ts: string; user?: string; text: string; thread_ts?: string; reply_count?: number }
 type Conversation = { channelId: string; channelName: string; isExternal: boolean; threadTs: string; messages: SlackMessage[] }
@@ -43,11 +44,13 @@ interface TaskCandidate {
  * way to know a real Slack ID unless it's a literal <@U123> mention in the
  * text, so asking it to invent one always produced "unknown."
  *
- * TESTING PHASE: all findings are DMed only to super_admins (Vector's
- * profiles.role, resolved to a Slack ID via echo_person by email — profiles
- * itself may not have slack_user_id populated), tagged with who was actually
- * in the conversation. To restore direct DMs to those participants once
- * ready, see the clearly marked block below.
+ * TESTING PHASE: all findings go only to TESTING_RECIPIENT_EMAIL (Ben),
+ * resolved via profiles.role = super_admin -> matched to echo_person by
+ * email for a working Slack ID. Chris is super_admin too but deliberately
+ * excluded from DMs for now per Ben's instruction — remove the
+ * TESTING_RECIPIENT_EMAIL filter below to restore DMs to all super_admins,
+ * and swap `superAdmins` for `peopleInvolved` in the send loop to restore
+ * direct-to-participant DMs once ready for the wider team.
  *
  * Two cost/noise guards:
  *  - A channel's first-ever scan is bounded to FIRST_SCAN_LOOKBACK_DAYS
@@ -89,7 +92,15 @@ async function main() {
     if (adminErr) throw new Error(`Cannot read profiles for super_admin: ${adminErr.message}`)
     if (!superAdminProfiles?.length) throw new Error('No super_admin found in profiles — nobody would receive triage DMs.')
 
-    const superAdmins = superAdminProfiles
+    // TESTING PHASE: restrict to one recipient regardless of how many
+    // super_admins exist. Remove this filter (use superAdminProfiles
+    // directly below) to notify everyone with the role.
+    const testingRecipients = superAdminProfiles.filter((sa) => sa.email?.toLowerCase() === TESTING_RECIPIENT_EMAIL)
+    if (!testingRecipients.length) {
+      throw new Error(`TESTING_RECIPIENT_EMAIL (${TESTING_RECIPIENT_EMAIL}) not found among super_admin profiles — check the email matches exactly.`)
+    }
+
+    const superAdmins = testingRecipients
       .map((sa) => {
         const echoMatch = sa.email ? staffByEmail.get(sa.email.toLowerCase()) : undefined
         return echoMatch
@@ -100,8 +111,8 @@ async function main() {
 
     if (!superAdmins.length) {
       throw new Error(
-        'super_admin(s) found in profiles, but none matched an echo_person by email — ' +
-        'check profiles.email lines up with echo_person.email for Ben/Chris.',
+        `${TESTING_RECIPIENT_EMAIL} found in profiles as super_admin, but did not match an echo_person by email — ` +
+        'check profiles.email lines up with echo_person.email.',
       )
     }
     const missingSlackId = superAdmins.filter((sa) => !sa.slack_user_id)
@@ -240,8 +251,6 @@ async function main() {
           console.warn(`  ${channel.name} thread ${convo.threadTs}: permalink fetch failed — ${err instanceof Error ? err.message : err}`)
         }
 
-        // Real participants: actual Slack authors on the thread, not an AI
-        // guess. Slack already tells us who wrote each message.
         const authorIds = [...new Set(convo.messages.map((m) => m.user).filter((u): u is string => Boolean(u)))]
         const peopleInvolved = authorIds
           .map((slackId) => staffBySlackId.get(slackId))
@@ -270,9 +279,6 @@ async function main() {
           console.log(`\n--- would flag (${verdict}, ${result.confidence}) ---\n${result.summary}\n`)
         }
 
-        // TESTING PHASE: DM super_admins only, not the conversation
-        // participants directly. To restore direct-to-participant DMs once
-        // ready, replace `superAdmins` with `peopleInvolved` below.
         const text = buildTriageMessage({
           verdict,
           channelId: convo.channelId,
