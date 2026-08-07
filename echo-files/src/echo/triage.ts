@@ -6,6 +6,7 @@ import { londonDay } from './lib/dates'
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
 const ANTHROPIC_MODEL = 'claude-sonnet-4-5' // confirm against whatever Vector's brief analyser uses
+const FIRST_SCAN_LOOKBACK_DAYS = 3 // a channel's first-ever scan only looks back this far, not full history
 
 type SlackMessage = { ts: string; user?: string; text: string; thread_ts?: string; reply_count?: number }
 type Conversation = { channelId: string; channelName: string; threadTs: string; messages: SlackMessage[] }
@@ -31,6 +32,11 @@ interface TaskCandidate {
  * staff involved when confident there's a gap — no task exists, or one
  * exists but has gone stale (reusing sweep's own dwell-breach definition,
  * echo_v_stale_tasks, rather than a separate threshold).
+ *
+ * A channel's first-ever scan is bounded to FIRST_SCAN_LOOKBACK_DAYS rather
+ * than full history — without this, day one on an old channel means reading
+ * years of messages and classifying all of them, which is slow and burns
+ * API credit on conversations long since resolved.
  *
  * Mirrors sweep.ts's error handling: loud, explicit, never swallowed.
  */
@@ -80,7 +86,7 @@ async function main() {
         .maybeSingle()
       if (checkpoint.error) throw new Error(`Cannot read echo_channel_scan: ${checkpoint.error.message}`)
 
-      const since = checkpoint.data?.last_scanned_ts ?? null
+      const since = checkpoint.data?.last_scanned_ts ?? slackTsFromDaysAgo(FIRST_SCAN_LOOKBACK_DAYS)
 
       let messages: SlackMessage[]
       try {
@@ -188,7 +194,7 @@ async function main() {
         }
       }
 
-      const newestTs = messages.reduce((max, m) => (m.ts > max ? m.ts : max), since ?? '0')
+      const newestTs = messages.reduce((max, m) => (m.ts > max ? m.ts : max), since)
       if (!dryRun) {
         await db.from('echo_channel_scan').upsert({
           channel_id: channel.id,
@@ -334,6 +340,11 @@ function buildTriageMessage(verdict: string, summary: string, taskUrl: string | 
   }
   if (slackPermalink) lines.push(`Original conversation: ${slackPermalink}`)
   return lines.join('\n')
+}
+
+/** Slack timestamps are seconds.microseconds since epoch, as a string. */
+function slackTsFromDaysAgo(days: number): string {
+  return (Date.now() / 1000 - days * 86_400).toFixed(6)
 }
 
 main().catch((e) => {
