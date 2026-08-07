@@ -130,11 +130,14 @@ export const teamwork: TeamworkApi = {
   openTasks: () =>
     pageAll<Task>('/projects/api/v3/tasks.json', 'tasks', {
       includeCompletedTasks: 'false',
+      projectStatus: 'active', // excludes tasks sitting in archived projects — unverified param name, check the log line after running
     }),
   task: (id) =>
     tw<{ task: Task }>(`/projects/api/v3/tasks/${id}.json`, {}).then((r) => r.task),
   people: () =>
     pageAll<Person>('/projects/api/v3/people.json', 'people', { type: 'account' }),
   projects: () =>
-    pageAll<Project>('/projects/api/v3/projects.json', 'projects', {}),
+    pageAll<Project>('/projects/api/v3/projects.json', 'projects', {
+      status: 'active', // excludes archived projects from matching
+    }),
 }
