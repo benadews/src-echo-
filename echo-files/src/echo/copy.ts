@@ -45,19 +45,49 @@ export function taskUrl(base: string, taskId: number): string {
   return `${base.replace(/\/$/, '')}/app/tasks/${taskId}`
 }
 
-const BANNED = [
-  'he', 'him', 'his', 'she', 'her', 'hers',
-  'missing', 'failed', 'owed', 'outstanding', 'overdue',
-  'violation', 'compliance', 'offender', 'guys',
-]
+/**
+ * Banned vocabulary, in three parts.
+ *
+ * PRONOUNS and JUDGEMENT apply to everything Echo sends. The first because
+ * Echo cannot know anyone's gender; the second because Echo reports and asks,
+ * it never passes verdict on a person.
+ *
+ * ACCUSATORY is different. Those words are banned in NUDGE copy, where Echo is
+ * addressing someone about their own time logging and every word lands
+ * personally. They are NOT banned in triage summaries, which paraphrase what
+ * other people said to each other — "chasing missing images" is an accurate
+ * description of a client conversation, not an accusation, and binning a real
+ * finding over it loses information for no benefit.
+ */
+const PRONOUNS = ['he', 'him', 'his', 'she', 'her', 'hers']
+const JUDGEMENT = ['violation', 'compliance', 'offender']
+const ACCUSATORY = ['missing', 'failed', 'owed', 'outstanding', 'overdue', 'guys']
 
-/** Throws if a message breaks the copy rules. Used at send time and in CI. */
-export function assertNoPronouns(text: string): void {
+const BANNED = [...PRONOUNS, ...JUDGEMENT, ...ACCUSATORY]
+const BANNED_TRIAGE = [...PRONOUNS, ...JUDGEMENT]
+
+function assertCopy(text: string, banned: string[]): void {
   const words = text.toLowerCase().match(/[a-z']+/g) ?? []
-  const hits = [...new Set(words.filter((w) => BANNED.includes(w)))]
+  const hits = [...new Set(words.filter((w) => banned.includes(w)))]
   if (hits.length) {
     throw new Error(`Copy rule violation — banned words present: ${hits.join(', ')}\n${text}`)
   }
+}
+
+/**
+ * Full rules — Echo speaking directly to a person about their own work.
+ * Used at send time for nudges and in CI.
+ */
+export function assertNoPronouns(text: string): void {
+  assertCopy(text, BANNED)
+}
+
+/**
+ * Reduced rules for triage findings, which describe conversations rather than
+ * address the reader. Pronouns and judgement words still throw.
+ */
+export function assertTriageCopy(text: string): void {
+  assertCopy(text, BANNED_TRIAGE)
 }
 
 export function timeQuestion(opts: {
