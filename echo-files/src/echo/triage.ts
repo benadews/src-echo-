@@ -1,6 +1,6 @@
 import { echoDb } from './lib/supabase'
 import { teamwork, type Task } from './lib/teamwork'
-import { listBotChannels, getHistorySince, getThreadReplies, getPermalink, getLatestMessageTs, sendDm } from './lib/slack'
+import { listBotChannels, getHistorySince, getThreadReplies, getPermalink, getLatestMessageTs, sendDm, lookupByEmail } from './lib/slack'
 import { assertNoPronouns } from './copy'
 import { londonDay } from './lib/dates'
 
@@ -20,15 +20,18 @@ const TRIAGE_RECIPIENT_EMAILS = (
   .map((e) => e.trim().toLowerCase())
   .filter(Boolean)
 
-// One DM per run, not one per finding. Six separate DMs inside a minute reads
-// as a malfunction even when every finding is correct.
+// One DM per run, not one per finding.
 const DIGEST_MAX_ITEMS = 8
+
+// Channels that will never map to a Teamwork project. Suppresses the
+// "is this project in Teamwork?" flag only — conversations in them are still
+// read and can still raise a task gap.
+// Anything containing "internal" is covered by the substring rule below.
+const NEVER_A_PROJECT_EXACT = new Set(['general', 'random', 'team-support'])
+const NEVER_A_PROJECT_CONTAINS = ['internal', 'loyaltylion', 'getbetter', 'refactor', 'partner', 'clearerio']
 
 const TW = process.env.TEAMWORK_BASE_URL ?? 'https://wetakeflight.eu.teamwork.com'
 const ECHO_URL = process.env.ECHO_DASHBOARD_URL ?? ''
-// Slack archive URLs are deterministic, so a permalink can always be built even
-// when chat.getPermalink returns nothing. A finding with no source link cannot
-// be verified, which makes it worse than no finding at all.
 const SLACK_WORKSPACE_URL = process.env.SLACK_WORKSPACE_URL ?? 'https://wetakeflight.slack.com'
 
 type SlackMessage = { ts: string; user?: string; text: string; thread_ts?: string; reply_count?: number }
@@ -46,11 +49,17 @@ interface TaskCandidate {
   projectName: string | null
   updatedAt: string
 }
+type Verdict = 'no_task_exists' | 'task_stale' | 'task_current' | 'project_unknown'
+type ProjectResolution =
+  | { kind: 'resolved'; projectId: number; projectName: string; via: 'override' | 'name' }
+  | { kind: 'ambiguous'; candidates: string[] }
+  | { kind: 'none' }
 type TriageItem = {
-  verdict: string
+  verdict: Verdict
   channelId: string
   channelName: string
   summary: string
+  projectName: string | null
   taskUrl: string | null
   taskName: string | null
   permalink: string | null
@@ -83,9 +92,7 @@ async function main() {
     const staffBySlackId = new Map((staff ?? []).filter((p) => p.slack_user_id).map((p) => [p.slack_user_id as string, p]))
     const staffByEmail = new Map((staff ?? []).filter((p) => p.email).map((p) => [p.email!.toLowerCase(), p]))
 
-    // Slack id -> human name, used to keep raw ids out of the transcript the
-    // model sees. The model can only echo back what it is given, and given
-    // "U08LS7J6E4D" it will happily print it into a summary.
+    // Slack id -> human name, so raw ids never reach the model or a summary.
     const nameBySlackId = new Map(
       (staff ?? [])
         .filter((p) => p.slack_user_id && p.full_name)
@@ -99,14 +106,13 @@ async function main() {
     if (adminErr) throw new Error(`Cannot read profiles for super_admin: ${adminErr.message}`)
     if (!superAdminProfiles?.length) throw new Error('No super_admin found in profiles — nobody would receive triage DMs.')
 
-    // Resolve each configured recipient independently. One person being
-    // misconfigured must not silence everybody else — that failure mode looks
-    // identical to "Echo stopped working" from the outside.
+    // Resolve each recipient independently. One person misconfigured must not
+    // silence everybody else — from the outside that looks like Echo dying.
     const recipients: { full_name: string; slack_user_id: string | null }[] = []
     for (const email of TRIAGE_RECIPIENT_EMAILS) {
       const profile = superAdminProfiles.find((sa) => sa.email?.toLowerCase() === email)
       if (!profile) {
-        console.warn(`  warning: ${email} is not a super_admin in profiles — skipped, no digest will reach this address.`)
+        console.warn(`  warning: ${email} is not a super_admin in profiles — skipped.`)
         continue
       }
       const echoMatch = staffByEmail.get(email)
@@ -114,13 +120,25 @@ async function main() {
         console.warn(`  warning: ${email} is a super_admin but did not match an echo_person by email — skipped.`)
         continue
       }
-      if (!echoMatch.slack_user_id) {
-        console.warn(`  warning: ${echoMatch.full_name} has no slack_user_id in echo_person — skipped when sending.`)
+
+      // Self-heal a missing Slack id rather than silently skipping. The nudge
+      // script has always done this; triage did not, which is how Chris was
+      // configured correctly everywhere and still received nothing.
+      let slackId = echoMatch.slack_user_id as string | null
+      if (!slackId && echoMatch.email) {
+        try {
+          slackId = await lookupByEmail(echoMatch.email)
+          if (slackId) {
+            await db.from('echo_person').update({ slack_user_id: slackId }).eq('id', echoMatch.id)
+            console.log(`  resolved and cached Slack id for ${echoMatch.full_name}.`)
+          }
+        } catch (err) {
+          console.warn(`  Slack lookup failed for ${echoMatch.email}: ${err instanceof Error ? err.message : err}`)
+        }
       }
-      recipients.push({
-        full_name: profile.full_name ?? echoMatch.full_name,
-        slack_user_id: echoMatch.slack_user_id as string | null,
-      })
+      if (!slackId) console.warn(`  warning: no Slack account found for ${echoMatch.full_name} — skipped when sending.`)
+
+      recipients.push({ full_name: profile.full_name ?? echoMatch.full_name, slack_user_id: slackId })
     }
 
     if (!recipients.length) {
@@ -136,6 +154,19 @@ async function main() {
     const projectNames = new Map(projectList.map((p) => [p.id, p.name]))
     console.log(`${openTasks.length} open task(s) across ${projectList.length} project(s).`)
 
+    // Tasks bucketed by project. Scoring a summary against all 905 open tasks
+    // is what produced the Limner task attached to a SHIFT conversation —
+    // with a pool that large, any two shared words look like a match.
+    const tasksByProject = new Map<number, Task[]>()
+    for (const task of openTasks) {
+      if (task.projectId == null) continue
+      const bucket = tasksByProject.get(task.projectId)
+      if (bucket) bucket.push(task)
+      else tasksByProject.set(task.projectId, [task])
+    }
+
+    const projectKeys = buildProjectKeys(projectList)
+
     console.log('Listing bot channels...')
     const channels = await listBotChannels()
     console.log(`${channels.length} channel(s) visible to the bot.`)
@@ -145,12 +176,16 @@ async function main() {
     let findingsWritten = 0
     let dmsSent = 0
     let dormantSkipped = 0
+    let notInChannel = 0
     const digestItems: TriageItem[] = []
+    // "Is this project in Teamwork?" is an observation about a channel, not
+    // about a conversation. Ten live threads in Croft Mill is one question.
+    const channelsAlreadyQueried = new Set<string>()
 
     for (const channel of channels) {
       const checkpoint = await db
         .from('echo_channel_scan')
-        .select('last_scanned_ts')
+        .select('last_scanned_ts, teamwork_project_id, is_excluded')
         .eq('channel_id', channel.id)
         .maybeSingle()
       if (checkpoint.error) throw new Error(`Cannot read echo_channel_scan: ${checkpoint.error.message}`)
@@ -159,7 +194,15 @@ async function main() {
       try {
         latestTs = await getLatestMessageTs(channel.id)
       } catch (err) {
-        console.error(`  ${channel.name}: latest-message check failed — ${err instanceof Error ? err.message : err}`)
+        const msg = err instanceof Error ? err.message : String(err)
+        // The bot is not a member. Nothing to be done in code — someone has to
+        // invite it — so log quietly rather than as an error.
+        if (msg.includes('not_in_channel')) {
+          notInChannel++
+          console.log(`  ${channel.name}: bot is not a member — invite it to scan this channel`)
+        } else {
+          console.error(`  ${channel.name}: latest-message check failed — ${msg}`)
+        }
         continue
       }
 
@@ -197,6 +240,15 @@ async function main() {
         continue
       }
 
+      // Work out which project this channel belongs to, once per channel.
+      const resolution = resolveProject(channel.name, checkpoint.data?.teamwork_project_id ?? null, projectKeys, projectNames)
+      const excluded = checkpoint.data?.is_excluded === true || isNeverAProject(channel.name)
+      if (resolution.kind === 'resolved') {
+        console.log(`  ${channel.name}: project = ${resolution.projectName} (via ${resolution.via})`)
+      } else if (resolution.kind === 'ambiguous') {
+        console.log(`  ${channel.name}: matches ${resolution.candidates.length} projects (${resolution.candidates.join(', ')}) — treating as unresolved, set teamwork_project_id to pin it`)
+      }
+
       const since = checkpoint.data?.last_scanned_ts ?? slackTsFromDaysAgo(FIRST_SCAN_LOOKBACK_DAYS)
 
       let messages: SlackMessage[]
@@ -231,8 +283,8 @@ async function main() {
       conversationsFound += conversations.length
 
       for (const convo of conversations) {
-        // limit(1) rather than maybeSingle(): duplicate rows for the same
-        // thread would make maybeSingle throw rather than report "seen it".
+        // limit(1) rather than maybeSingle(): duplicate rows for one thread
+        // would make maybeSingle throw rather than report "seen it".
         const already = await db
           .from('echo_triage_finding')
           .select('id')
@@ -252,15 +304,35 @@ async function main() {
 
         if (!result.isTaskSpecific || result.confidence === 'low') continue
 
-        // Belt and braces: even with names in the transcript, a stray id in the
-        // raw message text can survive into the summary.
         const summary = scrubSlackIds(result.summary, nameBySlackId)
 
-        const teamworkMatch = findMatchingTask(openTasks, projectNames, summary, result.likelyProjectOrClient)
-        const verdict = teamworkMatch
-          ? await assessStaleness(db, teamworkMatch.taskId, teamworkMatch.updatedAt)
-          : 'no_task_exists'
-        if (verdict === 'task_current') continue
+        let verdict: Verdict
+        let teamworkMatch: TaskCandidate | null = null
+
+        if (resolution.kind === 'resolved') {
+          // Search only this project's tasks. Two shared words means something
+          // in a pool of forty; it means nothing in a pool of nine hundred.
+          const pool = tasksByProject.get(resolution.projectId) ?? []
+          teamworkMatch = findMatchingTask(pool, projectNames, summary)
+          if (teamworkMatch) {
+            const staleness = await assessStaleness(db, teamworkMatch.taskId, teamworkMatch.updatedAt)
+            if (staleness === 'task_current') continue
+            verdict = 'task_stale'
+          } else {
+            verdict = 'no_task_exists'
+          }
+        } else if (excluded) {
+          // Internal or partner channel — no project expected, so the only
+          // useful question is whether a task should exist.
+          verdict = 'no_task_exists'
+        } else {
+          // Real work, in a client-facing channel, that maps to no active
+          // project. Either the project was never created, the channel is
+          // named unrecognisably, or work is continuing on something closed.
+          if (channelsAlreadyQueried.has(convo.channelId)) continue
+          channelsAlreadyQueried.add(convo.channelId)
+          verdict = 'project_unknown'
+        }
 
         const teamworkTaskUrl = teamworkMatch ? `${TW}/app/tasks/${teamworkMatch.taskId}` : null
 
@@ -277,6 +349,9 @@ async function main() {
           .map((slackId) => staffBySlackId.get(slackId))
           .filter((p): p is NonNullable<typeof p> => Boolean(p))
 
+        const resolvedProjectId = resolution.kind === 'resolved' ? resolution.projectId : null
+        const resolvedProjectName = resolution.kind === 'resolved' ? resolution.projectName : null
+
         if (!dryRun) {
           const ins = await db.from('echo_triage_finding').insert({
             channel_id: convo.channelId,
@@ -286,7 +361,7 @@ async function main() {
             summary,
             verdict,
             confidence: result.confidence,
-            teamwork_project_id: teamworkMatch?.projectId ?? null,
+            teamwork_project_id: teamworkMatch?.projectId ?? resolvedProjectId,
             teamwork_task_id: teamworkMatch?.taskId ?? null,
             teamwork_task_url: teamworkTaskUrl,
             people_involved: peopleInvolved.map((p) => ({ slack_user_id: p.slack_user_id, echo_person_id: p.id, dmd_at: null })),
@@ -297,7 +372,7 @@ async function main() {
           }
           findingsWritten++
         } else {
-          console.log(`\n--- would flag (${verdict}, ${result.confidence}) ---\n${summary}\n`)
+          console.log(`\n--- would flag (${verdict}, ${result.confidence}) in #${convo.channelName} ---\n${summary}\n`)
         }
 
         const item: TriageItem = {
@@ -305,13 +380,14 @@ async function main() {
           channelId: convo.channelId,
           channelName: convo.channelName,
           summary,
+          projectName: resolvedProjectName,
           taskUrl: teamworkTaskUrl,
           taskName: teamworkMatch?.taskName ?? null,
           permalink,
           involvedNames: peopleInvolved.map((p) => p.full_name),
         }
 
-        // Check each item on its own. Batching means one bad summary would
+        // Check each item alone. Batching means one bad summary would
         // otherwise take the whole digest down with it.
         try {
           assertNoPronouns(renderItem(item, 1))
@@ -334,7 +410,6 @@ async function main() {
       }
     }
 
-    // One digest, sent once, after every channel has been scanned.
     if (digestItems.length) {
       const digest = buildDigest(digestItems, DIGEST_MAX_ITEMS)
       for (const recipient of recipients) {
@@ -356,7 +431,7 @@ async function main() {
     }
 
     console.log(JSON.stringify(
-      { channelsScanned: channels.length, dormantSkipped, conversationsFound, classified, findingsWritten, digestItems: digestItems.length, dmsSent },
+      { channelsScanned: channels.length, notInChannel, dormantSkipped, conversationsFound, classified, findingsWritten, digestItems: digestItems.length, dmsSent },
       null, 2,
     ))
 
@@ -380,6 +455,100 @@ async function main() {
     throw err
   }
 }
+
+/* ------------------------------------------------------------------ *
+ * Channel → project resolution
+ * ------------------------------------------------------------------ */
+
+/**
+ * Reduces a project name to the client part: everything before the first
+ * separator. "Saicho - On Going Support" becomes "saicho", "British Bridal :
+ * Migrate, Design & Build" becomes "british bridal". Splitting BEFORE
+ * normalising matters — normalising first would turn every hyphen into a space
+ * and there would be nothing left to split on.
+ */
+function projectKey(name: string): string[] {
+  const head = name.split(/\s+[-:]\s+/)[0] ?? name
+  return normaliseTokens(head)
+}
+
+/**
+ * Lowercases, expands "&" to "and" (so #rose-and-walker reaches "Rose &
+ * Walker"), drops apostrophes so PACK'D reaches #packd, then splits on
+ * anything that is not alphanumeric.
+ */
+function normaliseTokens(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/['’]/g, '')
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)
+}
+
+function channelTokens(channelName: string): string[] {
+  // "wtf" is the agency's own prefix and appears in client channels at either
+  // end — #wtf-luxus-beds, #travelling-man-wtf. It carries no meaning here.
+  return normaliseTokens(channelName).filter((t) => t !== 'wtf')
+}
+
+function buildProjectKeys(projects: { id: number; name: string }[]): { id: number; name: string; key: string[] }[] {
+  return projects
+    .map((p) => ({ id: p.id, name: p.name, key: projectKey(p.name) }))
+    .filter((p) => p.key.length > 0)
+}
+
+/** Contiguous subsequence test — "flux" matches #flux but not #influx. */
+function containsSequence(haystack: string[], needle: string[]): boolean {
+  if (!needle.length || needle.length > haystack.length) return false
+  for (let i = 0; i <= haystack.length - needle.length; i++) {
+    let ok = true
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) { ok = false; break }
+    }
+    if (ok) return true
+  }
+  return false
+}
+
+function resolveProject(
+  channelName: string,
+  override: number | null,
+  projectKeys: { id: number; name: string; key: string[] }[],
+  projectNames: Map<number, string>,
+): ProjectResolution {
+  if (override != null) {
+    const name = projectNames.get(override)
+    if (name) return { kind: 'resolved', projectId: override, projectName: name, via: 'override' }
+    console.warn(`  ${channelName}: teamwork_project_id ${override} is set but is not an active project — falling back to name matching`)
+  }
+
+  const tokens = channelTokens(channelName)
+  const hits = projectKeys.filter((p) => containsSequence(tokens, p.key))
+  if (!hits.length) return { kind: 'none' }
+
+  // Longest key wins: #wtf-luxus-beds-design-build-morf should resolve to
+  // Luxus Beds on two tokens, not to something matching a single token.
+  const longest = Math.max(...hits.map((h) => h.key.length))
+  const best = hits.filter((h) => h.key.length === longest)
+
+  // A tie between different projects cannot be broken from the name alone —
+  // #saicho genuinely matches two Saicho projects, and guessing wrong is the
+  // exact failure this whole change exists to prevent.
+  if (best.length > 1) return { kind: 'ambiguous', candidates: best.map((b) => b.name) }
+
+  return { kind: 'resolved', projectId: best[0].id, projectName: best[0].name, via: 'name' }
+}
+
+function isNeverAProject(channelName: string): boolean {
+  const n = channelName.toLowerCase()
+  if (NEVER_A_PROJECT_EXACT.has(n)) return true
+  return NEVER_A_PROJECT_CONTAINS.some((frag) => n.includes(frag))
+}
+
+/* ------------------------------------------------------------------ *
+ * Classification
+ * ------------------------------------------------------------------ */
 
 async function classifyConversation(convo: Conversation, nameBySlackId: Map<string, string>): Promise<Classification> {
   // Names, not ids. Everything the model can see, it can repeat.
@@ -445,10 +614,9 @@ async function classifyConversation(convo: Conversation, nameBySlackId: Map<stri
 }
 
 /**
- * Replaces Slack user references with names. Handles both the <@U123|name>
- * mention form and bare ids pasted into message text. The digit lookahead stops
- * ordinary shouty words like UNSUBSCRIBE being mangled — every Slack id has at
- * least one number in it.
+ * Replaces Slack user references with names. Handles the <@U123|name> mention
+ * form and bare ids pasted into text. The digit lookahead stops ordinary shouty
+ * words being mangled — every Slack id contains at least one number.
  */
 function scrubSlackIds(text: string, nameBySlackId: Map<string, string>): string {
   return text
@@ -460,25 +628,20 @@ function buildPermalink(channelId: string, ts: string): string {
   return `${SLACK_WORKSPACE_URL}/archives/${channelId}/p${ts.replace('.', '')}`
 }
 
+/* ------------------------------------------------------------------ *
+ * Task matching, within a known project
+ * ------------------------------------------------------------------ */
+
 function findMatchingTask(
   tasks: Task[],
   projectNames: Map<number, string>,
   summary: string,
-  projectHint: string | null,
 ): TaskCandidate | null {
   const summaryWords = significantWords(summary)
-  const hintWords = projectHint ? significantWords(projectHint) : []
 
   let best: { task: Task; score: number } | null = null
-
   for (const task of tasks) {
-    const taskWords = significantWords(task.name)
-    const projName = task.projectId != null ? projectNames.get(task.projectId) ?? '' : ''
-    const projWords = significantWords(projName)
-
-    let score = overlapCount(summaryWords, taskWords)
-    if (hintWords.length && overlapCount(hintWords, projWords) > 0) score += 3
-
+    const score = overlapCount(summaryWords, significantWords(task.name))
     if (score > 0 && (!best || score > best.score)) best = { task, score }
   }
 
@@ -524,15 +687,29 @@ async function assessStaleness(
   return data ? 'task_stale' : 'task_current'
 }
 
+/* ------------------------------------------------------------------ *
+ * Digest
+ * ------------------------------------------------------------------ */
+
+function headingFor(verdict: Verdict): string {
+  if (verdict === 'task_stale') return '🕓 Task has not moved in a while'
+  if (verdict === 'project_unknown') return '❓ Is this project in Teamwork?'
+  return '🔍 Possible task gap'
+}
+
 function renderItem(item: TriageItem, position: number): string {
   const lines: string[] = []
-  const heading = item.verdict === 'no_task_exists' ? 'Possible task gap' : 'Task has not moved in a while'
-
-  lines.push(`*${position}. ${heading}* — <#${item.channelId}>`)
+  lines.push(`*${position}. ${headingFor(item.verdict)}* — <#${item.channelId}>`)
   lines.push(item.summary)
-  if (item.taskUrl && item.taskName) lines.push(`<${item.taskUrl}|*${item.taskName}*>`)
+
+  if (item.verdict === 'project_unknown') {
+    lines.push('No active Teamwork project matches this channel. Should there be one, or does the channel need mapping?')
+  } else if (item.taskUrl && item.taskName) {
+    lines.push(`<${item.taskUrl}|*${item.taskName}*>`)
+  }
 
   const meta: string[] = []
+  if (item.projectName) meta.push(item.projectName)
   if (item.permalink) meta.push(`<${item.permalink}|View the conversation>`)
   if (item.involvedNames.length) meta.push(`Involved: ${item.involvedNames.join(', ')}`)
   if (meta.length) lines.push(`_${meta.join(' · ')}_`)
@@ -541,18 +718,23 @@ function renderItem(item: TriageItem, position: number): string {
 }
 
 function buildDigest(items: TriageItem[], max: number): string {
-  const shown = items.slice(0, max)
-  const hidden = items.length - shown.length
+  // Project questions last — they are structural, not day-to-day.
+  const ordered = [...items].sort((a, b) => {
+    const rank = (v: Verdict) => (v === 'project_unknown' ? 1 : 0)
+    return rank(a.verdict) - rank(b.verdict)
+  })
+  const shown = ordered.slice(0, max)
+  const hidden = ordered.length - shown.length
   const label = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Europe/London', weekday: 'short', day: 'numeric', month: 'short',
   }).format(new Date())
 
   const lines: string[] = []
-  lines.push(`*Echo triage — ${label}* 🔍`)
+  lines.push(`*Echo triage — ${label}*`)
   lines.push('')
-  lines.push(items.length === 1
+  lines.push(ordered.length === 1
     ? 'One conversation worth a look from the latest scan.'
-    : `${items.length} conversations worth a look from the latest scan.`)
+    : `${ordered.length} conversations worth a look from the latest scan.`)
 
   shown.forEach((item, i) => {
     lines.push('')
