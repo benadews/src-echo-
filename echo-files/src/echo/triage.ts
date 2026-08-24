@@ -8,7 +8,28 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
 const ANTHROPIC_MODEL = 'claude-sonnet-4-5'
 const FIRST_SCAN_LOOKBACK_DAYS = 3
 const DORMANT_AFTER_DAYS = 30
-const TESTING_RECIPIENT_EMAIL = 'ben@wetakeflight.co.uk'
+
+// Who receives the triage digest. Everyone listed must be a super_admin in
+// profiles AND match an echo_person by email. Adding someone here is additive —
+// nothing is redirected, each recipient gets an identical copy.
+// Override without a deploy: ECHO_TRIAGE_RECIPIENTS="a@x.co.uk,b@x.co.uk"
+const TRIAGE_RECIPIENT_EMAILS = (
+  process.env.ECHO_TRIAGE_RECIPIENTS ?? 'ben@wetakeflight.co.uk,chris@wetakeflight.co.uk'
+)
+  .split(',')
+  .map((e) => e.trim().toLowerCase())
+  .filter(Boolean)
+
+// One DM per run, not one per finding. Six separate DMs inside a minute reads
+// as a malfunction even when every finding is correct.
+const DIGEST_MAX_ITEMS = 8
+
+const TW = process.env.TEAMWORK_BASE_URL ?? 'https://wetakeflight.eu.teamwork.com'
+const ECHO_URL = process.env.ECHO_DASHBOARD_URL ?? ''
+// Slack archive URLs are deterministic, so a permalink can always be built even
+// when chat.getPermalink returns nothing. A finding with no source link cannot
+// be verified, which makes it worse than no finding at all.
+const SLACK_WORKSPACE_URL = process.env.SLACK_WORKSPACE_URL ?? 'https://wetakeflight.slack.com'
 
 type SlackMessage = { ts: string; user?: string; text: string; thread_ts?: string; reply_count?: number }
 type Conversation = { channelId: string; channelName: string; isExternal: boolean; threadTs: string; messages: SlackMessage[] }
@@ -25,6 +46,16 @@ interface TaskCandidate {
   projectName: string | null
   updatedAt: string
 }
+type TriageItem = {
+  verdict: string
+  channelId: string
+  channelName: string
+  summary: string
+  taskUrl: string | null
+  taskName: string | null
+  permalink: string | null
+  involvedNames: string[]
+}
 
 async function main() {
   const db = echoDb()
@@ -33,6 +64,7 @@ async function main() {
   const probe = await db.from('echo_person').select('id').eq('is_staff', true).limit(1)
   if (probe.error) throw new Error(`Cannot read echo_person: ${probe.error.message}`)
   if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is required — add it as a repo secret before running triage.')
+  if (!TRIAGE_RECIPIENT_EMAILS.length) throw new Error('No triage recipients configured — nobody would receive the digest.')
 
   const runIns = await db
     .from('echo_run')
@@ -51,6 +83,15 @@ async function main() {
     const staffBySlackId = new Map((staff ?? []).filter((p) => p.slack_user_id).map((p) => [p.slack_user_id as string, p]))
     const staffByEmail = new Map((staff ?? []).filter((p) => p.email).map((p) => [p.email!.toLowerCase(), p]))
 
+    // Slack id -> human name, used to keep raw ids out of the transcript the
+    // model sees. The model can only echo back what it is given, and given
+    // "U08LS7J6E4D" it will happily print it into a summary.
+    const nameBySlackId = new Map(
+      (staff ?? [])
+        .filter((p) => p.slack_user_id && p.full_name)
+        .map((p) => [p.slack_user_id as string, p.full_name as string]),
+    )
+
     const { data: superAdminProfiles, error: adminErr } = await db
       .from('profiles')
       .select('id, full_name, email')
@@ -58,30 +99,37 @@ async function main() {
     if (adminErr) throw new Error(`Cannot read profiles for super_admin: ${adminErr.message}`)
     if (!superAdminProfiles?.length) throw new Error('No super_admin found in profiles — nobody would receive triage DMs.')
 
-    const testingRecipients = superAdminProfiles.filter((sa) => sa.email?.toLowerCase() === TESTING_RECIPIENT_EMAIL)
-    if (!testingRecipients.length) {
-      throw new Error(`TESTING_RECIPIENT_EMAIL (${TESTING_RECIPIENT_EMAIL}) not found among super_admin profiles — check the email matches exactly.`)
+    // Resolve each configured recipient independently. One person being
+    // misconfigured must not silence everybody else — that failure mode looks
+    // identical to "Echo stopped working" from the outside.
+    const recipients: { full_name: string; slack_user_id: string | null }[] = []
+    for (const email of TRIAGE_RECIPIENT_EMAILS) {
+      const profile = superAdminProfiles.find((sa) => sa.email?.toLowerCase() === email)
+      if (!profile) {
+        console.warn(`  warning: ${email} is not a super_admin in profiles — skipped, no digest will reach this address.`)
+        continue
+      }
+      const echoMatch = staffByEmail.get(email)
+      if (!echoMatch) {
+        console.warn(`  warning: ${email} is a super_admin but did not match an echo_person by email — skipped.`)
+        continue
+      }
+      if (!echoMatch.slack_user_id) {
+        console.warn(`  warning: ${echoMatch.full_name} has no slack_user_id in echo_person — skipped when sending.`)
+      }
+      recipients.push({
+        full_name: profile.full_name ?? echoMatch.full_name,
+        slack_user_id: echoMatch.slack_user_id as string | null,
+      })
     }
 
-    const superAdmins = testingRecipients
-      .map((sa) => {
-        const echoMatch = sa.email ? staffByEmail.get(sa.email.toLowerCase()) : undefined
-        return echoMatch
-          ? { full_name: sa.full_name ?? echoMatch.full_name, slack_user_id: echoMatch.slack_user_id as string | null }
-          : null
-      })
-      .filter((sa): sa is { full_name: string; slack_user_id: string | null } => sa !== null)
-
-    if (!superAdmins.length) {
+    if (!recipients.length) {
       throw new Error(
-        `${TESTING_RECIPIENT_EMAIL} found in profiles as super_admin, but did not match an echo_person by email — ` +
-        'check profiles.email lines up with echo_person.email.',
+        `None of the configured recipients (${TRIAGE_RECIPIENT_EMAILS.join(', ')}) resolved to a super_admin with an ` +
+        'echo_person match — check profiles.email lines up with echo_person.email.',
       )
     }
-    const missingSlackId = superAdmins.filter((sa) => !sa.slack_user_id)
-    if (missingSlackId.length) {
-      console.warn(`  warning: ${missingSlackId.map((sa) => sa.full_name).join(', ')} matched but has no slack_user_id in echo_person — will be skipped when sending.`)
-    }
+    console.log(`Digest recipients: ${recipients.map((r) => r.full_name).join(', ')}`)
 
     console.log('Loading open tasks and projects for matching...')
     const [openTasks, projectList] = await Promise.all([teamwork.openTasks(), teamwork.projects()])
@@ -97,6 +145,7 @@ async function main() {
     let findingsWritten = 0
     let dmsSent = 0
     let dormantSkipped = 0
+    const digestItems: TriageItem[] = []
 
     for (const channel of channels) {
       const checkpoint = await db
@@ -182,17 +231,19 @@ async function main() {
       conversationsFound += conversations.length
 
       for (const convo of conversations) {
+        // limit(1) rather than maybeSingle(): duplicate rows for the same
+        // thread would make maybeSingle throw rather than report "seen it".
         const already = await db
           .from('echo_triage_finding')
           .select('id')
           .eq('channel_id', convo.channelId)
           .eq('thread_ts', convo.threadTs)
-          .maybeSingle()
-        if (already.data) continue
+          .limit(1)
+        if (already.data?.length) continue
 
         let result: Classification
         try {
-          result = await classifyConversation(convo)
+          result = await classifyConversation(convo, nameBySlackId)
         } catch (err) {
           console.error(`  ${channel.name} thread ${convo.threadTs}: classification failed — ${err instanceof Error ? err.message : err}`)
           continue
@@ -201,13 +252,17 @@ async function main() {
 
         if (!result.isTaskSpecific || result.confidence === 'low') continue
 
-        const teamworkMatch = findMatchingTask(openTasks, projectNames, result.summary, result.likelyProjectOrClient)
+        // Belt and braces: even with names in the transcript, a stray id in the
+        // raw message text can survive into the summary.
+        const summary = scrubSlackIds(result.summary, nameBySlackId)
+
+        const teamworkMatch = findMatchingTask(openTasks, projectNames, summary, result.likelyProjectOrClient)
         const verdict = teamworkMatch
           ? await assessStaleness(db, teamworkMatch.taskId, teamworkMatch.updatedAt)
           : 'no_task_exists'
         if (verdict === 'task_current') continue
 
-        const teamworkTaskUrl = teamworkMatch ? `${process.env.TEAMWORK_BASE_URL}/#/tasks/${teamworkMatch.taskId}` : null
+        const teamworkTaskUrl = teamworkMatch ? `${TW}/app/tasks/${teamworkMatch.taskId}` : null
 
         let permalink: string | null = null
         try {
@@ -215,6 +270,7 @@ async function main() {
         } catch (err) {
           console.warn(`  ${channel.name} thread ${convo.threadTs}: permalink fetch failed — ${err instanceof Error ? err.message : err}`)
         }
+        if (!permalink) permalink = buildPermalink(convo.channelId, convo.threadTs)
 
         const authorIds = [...new Set(convo.messages.map((m) => m.user).filter((u): u is string => Boolean(u)))]
         const peopleInvolved = authorIds
@@ -227,7 +283,7 @@ async function main() {
             channel_name: convo.channelName,
             thread_ts: convo.threadTs,
             slack_permalink: permalink,
-            summary: result.summary,
+            summary,
             verdict,
             confidence: result.confidence,
             teamwork_project_id: teamworkMatch?.projectId ?? null,
@@ -241,32 +297,28 @@ async function main() {
           }
           findingsWritten++
         } else {
-          console.log(`\n--- would flag (${verdict}, ${result.confidence}) ---\n${result.summary}\n`)
+          console.log(`\n--- would flag (${verdict}, ${result.confidence}) ---\n${summary}\n`)
         }
 
-        const text = buildTriageMessage({
+        const item: TriageItem = {
           verdict,
           channelId: convo.channelId,
-          summary: result.summary,
+          channelName: convo.channelName,
+          summary,
           taskUrl: teamworkTaskUrl,
           taskName: teamworkMatch?.taskName ?? null,
           permalink,
           involvedNames: peopleInvolved.map((p) => p.full_name),
-        })
-        assertNoPronouns(text)
+        }
 
-        for (const admin of superAdmins) {
-          if (!admin.slack_user_id) continue
-          if (dryRun) {
-            console.log(`--- would DM ${admin.full_name} ---\n${text}\n`)
-            continue
-          }
-          try {
-            await sendDm(admin.slack_user_id, text)
-            dmsSent++
-          } catch (err) {
-            console.error(`  DM to ${admin.full_name} failed: ${err instanceof Error ? err.message : err}`)
-          }
+        // Check each item on its own. Batching means one bad summary would
+        // otherwise take the whole digest down with it.
+        try {
+          assertNoPronouns(renderItem(item, 1))
+          digestItems.push(item)
+        } catch (err) {
+          console.warn(`  ${channel.name} thread ${convo.threadTs}: dropped from digest by copy guard — ${err instanceof Error ? err.message : err}`)
+          console.warn(`    summary was: ${summary}`)
         }
       }
 
@@ -282,8 +334,29 @@ async function main() {
       }
     }
 
+    // One digest, sent once, after every channel has been scanned.
+    if (digestItems.length) {
+      const digest = buildDigest(digestItems, DIGEST_MAX_ITEMS)
+      for (const recipient of recipients) {
+        if (!recipient.slack_user_id) continue
+        if (dryRun) {
+          console.log(`\n--- would DM ${recipient.full_name} ---\n${digest}\n`)
+          continue
+        }
+        try {
+          await sendDm(recipient.slack_user_id, digest)
+          dmsSent++
+          console.log(`Digest sent to ${recipient.full_name} (${digestItems.length} item(s)).`)
+        } catch (err) {
+          console.error(`  DM to ${recipient.full_name} failed: ${err instanceof Error ? err.message : err}`)
+        }
+      }
+    } else {
+      console.log('Nothing worth flagging this run — no digest sent.')
+    }
+
     console.log(JSON.stringify(
-      { channelsScanned: channels.length, dormantSkipped, conversationsFound, classified, findingsWritten, dmsSent },
+      { channelsScanned: channels.length, dormantSkipped, conversationsFound, classified, findingsWritten, digestItems: digestItems.length, dmsSent },
       null, 2,
     ))
 
@@ -308,8 +381,14 @@ async function main() {
   }
 }
 
-async function classifyConversation(convo: Conversation): Promise<Classification> {
-  const transcript = convo.messages.map((m) => `${m.user ?? 'unknown'}: ${m.text}`).join('\n')
+async function classifyConversation(convo: Conversation, nameBySlackId: Map<string, string>): Promise<Classification> {
+  // Names, not ids. Everything the model can see, it can repeat.
+  const transcript = convo.messages
+    .map((m) => {
+      const who = (m.user && nameBySlackId.get(m.user)) ?? 'a colleague'
+      return `${who}: ${scrubSlackIds(m.text, nameBySlackId)}`
+    })
+    .join('\n')
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -326,9 +405,15 @@ async function classifyConversation(convo: Conversation): Promise<Classification
         'not general work-adjacent chatter. Only flag a conversation if it contains one of these concrete things:\n' +
         '- A specific resource or time commitment (a named person, a deadline, a piece of work) that should be tracked\n' +
         '- An assignment or ownership gap that puts a deadline at risk\n' +
+        '- A client request for new work, a change, or a fix that does not obviously already exist as a task\n' +
         '- Clear evidence someone is ready to act on a task that Teamwork shows as stale or unclear\n\n' +
         'Do NOT flag:\n' +
         '- Status updates or logistics ("missing standup," "will be at my desk," "following up soon")\n' +
+        '- Arranging, moving or confirming meetings, calls and availability — scheduling is not a deliverable\n' +
+        '- Requests to send, resend, re-upload or re-share something that already exists (files, fonts, videos, ' +
+        'links, screenshots, logins) — handing over an existing asset is a two-minute favour, not tracked work\n' +
+        '- ANY conversation about Teamwork itself: logging or adjusting time, updating or tidying tasks, chasing ' +
+        'someone to use Teamwork, asking where a task lives. This is administration of the system, never a work gap\n' +
         '- Mentions that something is scheduled or pending without a concrete ask ("waiting to present to stakeholders")\n' +
         '- General check-ins or "just letting you know" messages with no decision or commitment attached\n' +
         '- Comments or feedback on a Teamwork task that ALREADY EXISTS and is simply being discussed — the task being ' +
@@ -337,8 +422,16 @@ async function classifyConversation(convo: Conversation): Promise<Classification
         'task of their own — these are judgment calls, not work gaps\n\n' +
         'Test: would this conversation, if read alone, tell you EXACTLY what task should be created or updated, and why it ' +
         'matters now? If not, it is not task-specific enough to flag, even if it mentions real project names or people.\n\n' +
+        'Summary rules — these are hard requirements, not style preferences:\n' +
+        '- Name the actual deliverable. If you cannot say WHAT the work is, set isTaskSpecific false. A summary ' +
+        'containing "something", "a thing", "some work" or similar is proof the conversation was too vague to flag\n' +
+        '- Name the person responsible where the messages make it clear. Do not write "someone" or "a user" as a ' +
+        'substitute for a name you were given\n' +
+        '- NEVER output a raw Slack user id (anything shaped like U01ABC2DEF) in the summary. If you only have an id ' +
+        'and no name, describe the person by role or omit them entirely\n' +
+        '- One sentence, plain English, no Slack formatting\n\n' +
         'Respond with ONLY a JSON object, no prose, no markdown fences: ' +
-        '{"isTaskSpecific": boolean, "confidence": "high"|"medium"|"low", "summary": string (one sentence, plain English), ' +
+        '{"isTaskSpecific": boolean, "confidence": "high"|"medium"|"low", "summary": string, ' +
         '"likelyProjectOrClient": string|null}. ' +
         'Be conservative: when in doubt, mark isTaskSpecific false rather than low confidence — false negatives are far ' +
         'cheaper here than noise.',
@@ -349,6 +442,22 @@ async function classifyConversation(convo: Conversation): Promise<Classification
   const data = await res.json()
   const text = data.content?.[0]?.text ?? '{}'
   return JSON.parse(text.replace(/```json|```/g, '').trim())
+}
+
+/**
+ * Replaces Slack user references with names. Handles both the <@U123|name>
+ * mention form and bare ids pasted into message text. The digit lookahead stops
+ * ordinary shouty words like UNSUBSCRIBE being mangled — every Slack id has at
+ * least one number in it.
+ */
+function scrubSlackIds(text: string, nameBySlackId: Map<string, string>): string {
+  return text
+    .replace(/<@([UW][A-Z0-9]+)(\|[^>]*)?>/g, (_m, id: string) => nameBySlackId.get(id) ?? 'a colleague')
+    .replace(/\b(?=[UW][A-Z0-9]*\d)[UW][A-Z0-9]{6,}\b/g, (m: string) => nameBySlackId.get(m) ?? 'a colleague')
+}
+
+function buildPermalink(channelId: string, ts: string): string {
+  return `${SLACK_WORKSPACE_URL}/archives/${channelId}/p${ts.replace('.', '')}`
 }
 
 function findMatchingTask(
@@ -415,44 +524,45 @@ async function assessStaleness(
   return data ? 'task_stale' : 'task_current'
 }
 
-function buildTriageMessage(opts: {
-  verdict: string
-  channelId: string
-  summary: string
-  taskUrl: string | null
-  taskName: string | null
-  permalink: string | null
-  involvedNames: string[]
-}): string {
-  const { verdict, channelId, summary, taskUrl, taskName, permalink, involvedNames } = opts
+function renderItem(item: TriageItem, position: number): string {
   const lines: string[] = []
+  const heading = item.verdict === 'no_task_exists' ? 'Possible task gap' : 'Task has not moved in a while'
 
-  if (verdict === 'no_task_exists') {
-    lines.push(`*Possible task gap spotted* 🔍`)
-    lines.push('')
-    lines.push(`In <#${channelId}>:`)
-    lines.push(summary)
-    lines.push('')
-    lines.push('Worth creating a task for this, or is it already covered somewhere?')
-  } else {
-    lines.push(`*Task hasn't moved in a while* 🕓`)
-    lines.push('')
-    lines.push(`In <#${channelId}>:`)
-    lines.push(summary)
-    if (taskUrl && taskName) {
-      lines.push('')
-      lines.push(`<${taskUrl}|*${taskName}*>`)
-    }
-  }
+  lines.push(`*${position}. ${heading}* — <#${item.channelId}>`)
+  lines.push(item.summary)
+  if (item.taskUrl && item.taskName) lines.push(`<${item.taskUrl}|*${item.taskName}*>`)
 
-  if (permalink) {
-    lines.push('')
-    lines.push(`_<${permalink}|View the conversation>_`)
-  }
+  const meta: string[] = []
+  if (item.permalink) meta.push(`<${item.permalink}|View the conversation>`)
+  if (item.involvedNames.length) meta.push(`Involved: ${item.involvedNames.join(', ')}`)
+  if (meta.length) lines.push(`_${meta.join(' · ')}_`)
 
-  if (involvedNames.length) {
+  return lines.join('\n')
+}
+
+function buildDigest(items: TriageItem[], max: number): string {
+  const shown = items.slice(0, max)
+  const hidden = items.length - shown.length
+  const label = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/London', weekday: 'short', day: 'numeric', month: 'short',
+  }).format(new Date())
+
+  const lines: string[] = []
+  lines.push(`*Echo triage — ${label}* 🔍`)
+  lines.push('')
+  lines.push(items.length === 1
+    ? 'One conversation worth a look from the latest scan.'
+    : `${items.length} conversations worth a look from the latest scan.`)
+
+  shown.forEach((item, i) => {
     lines.push('')
-    lines.push(`_Involved: ${involvedNames.join(', ')}_`)
+    lines.push('───────────')
+    lines.push(renderItem(item, i + 1))
+  })
+
+  if (hidden > 0) {
+    lines.push('')
+    lines.push(ECHO_URL ? `_+ ${hidden} more · <${ECHO_URL}|see the full list>_` : `_+ ${hidden} more in Echo._`)
   }
 
   return lines.join('\n')
