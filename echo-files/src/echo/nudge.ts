@@ -14,6 +14,12 @@ const TW = process.env.TEAMWORK_BASE_URL ?? 'https://wetakeflight.eu.teamwork.co
 // for logging time — that always goes to Teamwork.
 const ECHO_URL = process.env.ECHO_DASHBOARD_URL ?? ''
 
+// How far back a work day can be and still be worth asking about. Findings
+// older than this are left pending but never sent: being asked on the 13th
+// about the 3rd is not a nudge, it is an accusation about something nobody
+// remembers. Five days covers a long weekend plus a day.
+const NUDGE_MAX_AGE_DAYS = 5
+
 /**
  * Echo nudge — sends the daily DM.
  *
@@ -61,6 +67,9 @@ async function main() {
   const toneFor = new Map((policies ?? []).map((p) => [p.role_class, p.tone as string]))
 
   const today = londonDay(new Date())
+  // Floor for how old a work_date can be. Computed once so every person in the
+  // run is judged against the same cutoff.
+  const oldestWorkDate = londonDay(new Date(Date.now() - NUDGE_MAX_AGE_DAYS * 86_400_000))
   let sent = 0
 
   for (const person of people) {
@@ -81,17 +90,41 @@ async function main() {
       continue
     }
 
-    // The most recent unanswered time question.
-    const { data: findings } = await db
+    // Candidate time questions, newest first, nothing older than the cutoff.
+    // Taking several rather than one matters: the newest candidate may be a
+    // duplicate of a day already asked about, and we want the next best rather
+    // than nothing at all.
+    const { data: candidates } = await db
       .from('echo_finding')
       .select('id, kind, work_date, evidence_count, has_completed_task, human_summary, single_sitting')
       .eq('person_id', person.id)
       .in('kind', ['active_day_unlogged', 'active_day_partial'])
-      .in('status', ['pending'])
+      .eq('status', 'pending')
+      .gte('work_date', oldestWorkDate)
       .order('work_date', { ascending: false })
-      .limit(1)
+      .limit(10)
 
-    let finding = findings?.[0]
+    // Days this person has already been asked about. The sweep can write a
+    // second finding for a work_date that was already notified, which is how
+    // Mon 3 Aug went out twice with different numbers. One question per day,
+    // ever, regardless of how many findings exist for it.
+    const { data: alreadyAsked } = await db
+      .from('echo_finding')
+      .select('work_date')
+      .eq('person_id', person.id)
+      .in('kind', ['active_day_unlogged', 'active_day_partial'])
+      .eq('status', 'notified')
+      .gte('work_date', oldestWorkDate)
+
+    const askedDays = new Set((alreadyAsked ?? []).map((f) => f.work_date as string))
+    const fresh = (candidates ?? []).filter((f) => !askedDays.has(f.work_date as string))
+
+    if ((candidates?.length ?? 0) > fresh.length) {
+      const dupes = (candidates ?? []).length - fresh.length
+      console.log(`${person.full_name}: ${dupes} candidate(s) skipped — already asked about that day`)
+    }
+
+    let finding = fresh[0]
     let text: string
 
     if (!finding) {
@@ -177,7 +210,7 @@ async function main() {
     assertNoPronouns(text)
 
     if (dryRun) {
-      console.log(`\n--- would send to ${person.full_name} ---\n${text}\n`)
+      console.log(`\n--- would send to ${person.full_name} (${finding.work_date}) ---\n${text}\n`)
       continue
     }
 
@@ -196,7 +229,7 @@ async function main() {
     } else {
       await db.from('echo_finding').update({ status: 'notified' }).eq('id', finding.id)
       sent++
-      console.log(`${person.full_name}: sent`)
+      console.log(`${person.full_name}: sent (${finding.work_date})`)
     }
   }
   console.log(`\nDone. ${sent} message(s) sent.`)
