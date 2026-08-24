@@ -1,7 +1,7 @@
 import { echoDb } from './lib/supabase'
 import { teamwork, type Task } from './lib/teamwork'
 import { listBotChannels, getHistorySince, getThreadReplies, getPermalink, getLatestMessageTs, sendDm, lookupByEmail } from './lib/slack'
-import { assertNoPronouns } from './copy'
+import { assertTriageCopy } from './copy'
 import { londonDay } from './lib/dates'
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
@@ -388,9 +388,11 @@ async function main() {
         }
 
         // Check each item alone. Batching means one bad summary would
-        // otherwise take the whole digest down with it.
+        // otherwise take the whole digest down with it. Triage uses the
+        // reduced rule set — a summary saying a client chased missing images
+        // is accurate reporting, not Echo accusing anyone of anything.
         try {
-          assertNoPronouns(renderItem(item, 1))
+          assertTriageCopy(renderItem(item, 1))
           digestItems.push(item)
         } catch (err) {
           console.warn(`  ${channel.name} thread ${convo.threadTs}: dropped from digest by copy guard — ${err instanceof Error ? err.message : err}`)
@@ -596,6 +598,7 @@ async function classifyConversation(convo: Conversation, nameBySlackId: Map<stri
         'containing "something", "a thing", "some work" or similar is proof the conversation was too vague to flag\n' +
         '- Name the person responsible where the messages make it clear. Do not write "someone" or "a user" as a ' +
         'substitute for a name you were given\n' +
+        '- Never use he, him, his, she, her or hers. Refer to people by name, or by role if no name is available\n' +
         '- NEVER output a raw Slack user id (anything shaped like U01ABC2DEF) in the summary. If you only have an id ' +
         'and no name, describe the person by role or omit them entirely\n' +
         '- One sentence, plain English, no Slack formatting\n\n' +
