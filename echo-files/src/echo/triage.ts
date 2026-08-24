@@ -9,9 +9,10 @@ const ANTHROPIC_MODEL = 'claude-sonnet-4-5'
 const FIRST_SCAN_LOOKBACK_DAYS = 3
 const DORMANT_AFTER_DAYS = 30
 
-// Who receives the triage digest. Everyone listed must be a super_admin in
-// profiles AND match an echo_person by email. Adding someone here is additive —
-// nothing is redirected, each recipient gets an identical copy.
+// Who can receive triage DMs at all. This is the gate: routing below decides
+// WHICH findings a person sees, this decides WHETHER they are messaged.
+// Everyone listed must be a super_admin in profiles AND match an echo_person
+// by email. Adding someone here is additive — nothing is redirected.
 // Override without a deploy: ECHO_TRIAGE_RECIPIENTS="a@x.co.uk,b@x.co.uk"
 const TRIAGE_RECIPIENT_EMAILS = (
   process.env.ECHO_TRIAGE_RECIPIENTS ?? 'ben@wetakeflight.co.uk,chris@wetakeflight.co.uk'
@@ -20,7 +21,13 @@ const TRIAGE_RECIPIENT_EMAILS = (
   .map((e) => e.trim().toLowerCase())
   .filter(Boolean)
 
-// One DM per run, not one per finding.
+// The catch-all sees every finding, including ones involving nobody. Everyone
+// else sees only threads they posted in. While Echo is being validated this is
+// deliberately one person — the catch-all carries the noise so the others can
+// judge Echo on findings that are actually theirs.
+const CATCH_ALL_EMAIL = (process.env.ECHO_TRIAGE_CATCH_ALL ?? 'ben@wetakeflight.co.uk').toLowerCase()
+
+// One DM per person per run, not one per finding.
 const DIGEST_MAX_ITEMS = 8
 
 // Channels that will never map to a Teamwork project. Suppresses the
@@ -54,6 +61,7 @@ type ProjectResolution =
   | { kind: 'resolved'; projectId: number; projectName: string; via: 'override' | 'name' }
   | { kind: 'ambiguous'; candidates: string[] }
   | { kind: 'none' }
+type Recipient = { email: string; full_name: string; slack_user_id: string | null; isCatchAll: boolean }
 type TriageItem = {
   verdict: Verdict
   channelId: string
@@ -64,6 +72,9 @@ type TriageItem = {
   taskName: string | null
   permalink: string | null
   involvedNames: string[]
+  /** Slack ids of staff who posted in the thread. This is what routes the
+   *  finding — a person sees it because they were part of the conversation. */
+  involvedSlackIds: string[]
 }
 
 async function main() {
@@ -108,7 +119,7 @@ async function main() {
 
     // Resolve each recipient independently. One person misconfigured must not
     // silence everybody else — from the outside that looks like Echo dying.
-    const recipients: { full_name: string; slack_user_id: string | null }[] = []
+    const recipients: Recipient[] = []
     for (const email of TRIAGE_RECIPIENT_EMAILS) {
       const profile = superAdminProfiles.find((sa) => sa.email?.toLowerCase() === email)
       if (!profile) {
@@ -138,7 +149,12 @@ async function main() {
       }
       if (!slackId) console.warn(`  warning: no Slack account found for ${echoMatch.full_name} — skipped when sending.`)
 
-      recipients.push({ full_name: profile.full_name ?? echoMatch.full_name, slack_user_id: slackId })
+      recipients.push({
+        email,
+        full_name: profile.full_name ?? echoMatch.full_name,
+        slack_user_id: slackId,
+        isCatchAll: email === CATCH_ALL_EMAIL,
+      })
     }
 
     if (!recipients.length) {
@@ -147,7 +163,10 @@ async function main() {
         'echo_person match — check profiles.email lines up with echo_person.email.',
       )
     }
-    console.log(`Digest recipients: ${recipients.map((r) => r.full_name).join(', ')}`)
+    if (!recipients.some((r) => r.isCatchAll)) {
+      console.warn(`  warning: catch-all ${CATCH_ALL_EMAIL} is not among the resolved recipients — findings involving nobody will reach no one.`)
+    }
+    console.log(`Digest recipients: ${recipients.map((r) => r.isCatchAll ? `${r.full_name} (catch-all)` : r.full_name).join(', ')}`)
 
     console.log('Loading open tasks and projects for matching...')
     const [openTasks, projectList] = await Promise.all([teamwork.openTasks(), teamwork.projects()])
@@ -177,7 +196,7 @@ async function main() {
     let dmsSent = 0
     let dormantSkipped = 0
     let notInChannel = 0
-    const digestItems: TriageItem[] = []
+    const allItems: TriageItem[] = []
     // "Is this project in Teamwork?" is an observation about a channel, not
     // about a conversation. Ten live threads in Croft Mill is one question.
     const channelsAlreadyQueried = new Set<string>()
@@ -385,6 +404,7 @@ async function main() {
           taskName: teamworkMatch?.taskName ?? null,
           permalink,
           involvedNames: peopleInvolved.map((p) => p.full_name),
+          involvedSlackIds: peopleInvolved.map((p) => p.slack_user_id as string).filter(Boolean),
         }
 
         // Check each item alone. Batching means one bad summary would
@@ -393,7 +413,7 @@ async function main() {
         // is accurate reporting, not Echo accusing anyone of anything.
         try {
           assertTriageCopy(renderItem(item, 1))
-          digestItems.push(item)
+          allItems.push(item)
         } catch (err) {
           console.warn(`  ${channel.name} thread ${convo.threadTs}: dropped from digest by copy guard — ${err instanceof Error ? err.message : err}`)
           console.warn(`    summary was: ${summary}`)
@@ -412,28 +432,31 @@ async function main() {
       }
     }
 
-    if (digestItems.length) {
-      const digest = buildDigest(digestItems, DIGEST_MAX_ITEMS)
-      for (const recipient of recipients) {
-        if (!recipient.slack_user_id) continue
-        if (dryRun) {
-          console.log(`\n--- would DM ${recipient.full_name} ---\n${digest}\n`)
-          continue
-        }
-        try {
-          await sendDm(recipient.slack_user_id, digest)
-          dmsSent++
-          console.log(`Digest sent to ${recipient.full_name} (${digestItems.length} item(s)).`)
-        } catch (err) {
-          console.error(`  DM to ${recipient.full_name} failed: ${err instanceof Error ? err.message : err}`)
-        }
+    // One digest per person, containing only what belongs to that person.
+    for (const recipient of recipients) {
+      const mine = itemsFor(recipient, allItems)
+      if (!mine.length) {
+        console.log(`${recipient.full_name}: nothing relevant this run — no digest.`)
+        continue
       }
-    } else {
-      console.log('Nothing worth flagging this run — no digest sent.')
+      if (!recipient.slack_user_id) continue
+
+      const digest = buildDigest(mine, DIGEST_MAX_ITEMS)
+      if (dryRun) {
+        console.log(`\n--- would DM ${recipient.full_name} (${mine.length} of ${allItems.length}) ---\n${digest}\n`)
+        continue
+      }
+      try {
+        await sendDm(recipient.slack_user_id, digest)
+        dmsSent++
+        console.log(`Digest sent to ${recipient.full_name} (${mine.length} item(s)).`)
+      } catch (err) {
+        console.error(`  DM to ${recipient.full_name} failed: ${err instanceof Error ? err.message : err}`)
+      }
     }
 
     console.log(JSON.stringify(
-      { channelsScanned: channels.length, notInChannel, dormantSkipped, conversationsFound, classified, findingsWritten, digestItems: digestItems.length, dmsSent },
+      { channelsScanned: channels.length, notInChannel, dormantSkipped, conversationsFound, classified, findingsWritten, findings: allItems.length, dmsSent },
       null, 2,
     ))
 
@@ -456,6 +479,24 @@ async function main() {
     }
     throw err
   }
+}
+
+/**
+ * Which findings a given person should see.
+ *
+ * The catch-all sees everything — including findings involving nobody, which
+ * are often the most valuable (a client asking for work that nobody has
+ * replied to yet) and would otherwise reach no one.
+ *
+ * Everyone else sees only threads they posted in. Not "their client", not
+ * "their project" — their actual conversations. A person can always verify a
+ * finding against a conversation they were part of, which is what makes the
+ * flag answerable rather than just noise about someone else's work.
+ */
+function itemsFor(recipient: Recipient, items: TriageItem[]): TriageItem[] {
+  if (recipient.isCatchAll) return items
+  if (!recipient.slack_user_id) return []
+  return items.filter((i) => i.involvedSlackIds.includes(recipient.slack_user_id as string))
 }
 
 /* ------------------------------------------------------------------ *
