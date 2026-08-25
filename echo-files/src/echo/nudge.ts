@@ -20,6 +20,13 @@ const ECHO_URL = process.env.ECHO_DASHBOARD_URL ?? ''
 // remembers. Five days covers a long weekend plus a day.
 const NUDGE_MAX_AGE_DAYS = 5
 
+// How old an unanswered question can be and still earn a footer slot. Beyond
+// this it stops being repeated daily and only counts toward "+N more". Sorting
+// oldest-first meant the same two questions held the top slots indefinitely —
+// nothing newer could ever displace them, so the footer became wallpaper.
+// Something ignored for a fortnight is an escalation, not a nudge.
+const FOOTER_MENTION_MAX_DAYS = 14
+
 /**
  * Echo nudge — sends the daily DM.
  *
@@ -259,12 +266,18 @@ async function buildFooter(db: ReturnType<typeof echoDb>, personId: string, max:
 
   const room = Math.max(0, max - items.length)
   if (room > 0) {
+    // Freshest first, and nothing past the cutoff. Ordering oldest-first meant
+    // the two longest-unanswered questions occupied the footer permanently:
+    // by definition nothing could ever be older than them, so the list could
+    // only change when they were answered — which is precisely what was not
+    // happening. Newer questions are also the ones most likely to be cleared.
     const { data: mentions } = await db
       .from('echo_v_open_mentions')
       .select('teamwork_task_id, asked_by, days_waiting, comment_excerpt')
       .eq('mentioned_person_id', personId)
       .gte('days_waiting', 2)
-      .order('days_waiting', { ascending: false })
+      .lte('days_waiting', FOOTER_MENTION_MAX_DAYS)
+      .order('days_waiting', { ascending: true })
       .limit(room)
 
     // echo_mention stores only the task id, so resolve names from the stage
@@ -294,12 +307,27 @@ async function buildFooter(db: ReturnType<typeof echoDb>, personId: string, max:
     }
   }
 
-  const { count } = await db
+  // "+N more" has to count the same population the list is drawn from, or the
+  // number is fiction. It previously counted every stale task including legacy
+  // backlog and estimated entry dates — rows that can never be displayed — and
+  // ignored mentions entirely. Mentions past FOOTER_MENTION_MAX_DAYS still
+  // count here even though they are no longer shown: they have not gone away,
+  // they have just stopped being worth repeating every morning.
+  const { count: staleTotal } = await db
     .from('echo_v_stale_tasks')
     .select('teamwork_task_id', { count: 'exact', head: true })
     .eq('assignee_person_id', personId)
     .eq('breach_owner', 'assignee')
-  const hidden = Math.max(0, (count ?? 0) - items.length)
+    .eq('is_legacy_backlog', false)
+    .eq('entered_at_is_estimate', false)
+
+  const { count: mentionTotal } = await db
+    .from('echo_v_open_mentions')
+    .select('teamwork_task_id', { count: 'exact', head: true })
+    .eq('mentioned_person_id', personId)
+    .gte('days_waiting', 2)
+
+  const hidden = Math.max(0, (staleTotal ?? 0) + (mentionTotal ?? 0) - items.length)
 
   return footer(items.slice(0, max), hidden, TW, ECHO_URL || undefined)
 }
