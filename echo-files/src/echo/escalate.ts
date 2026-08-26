@@ -6,26 +6,40 @@ import { londonDay } from './lib/dates'
 /**
  * The alarm bell (spec section 7).
  *
- * Ben keeps his existing relationship with the team and Echo stops copying him
- * in by default. He hears about someone only when Echo has genuinely stopped
- * getting anywhere over a rolling 14 days.
+ * Echo stops copying admins in by default. They hear about someone only when
+ * Echo has genuinely stopped getting anywhere over a rolling 14 days.
  *
- * Four outcomes, and only two of them involve Ben:
+ * Four outcomes, and only two of them reach an admin:
  *
  *   blocked_dependency     answers are mostly "waiting on X" -> raise the
  *                          DEPENDENCY, never a mark against the person waiting
  *   ease_off               ignoring Echo but clearing work and recording time
  *                          -> reduce cadence, tell nobody. Echo being redundant
  *                          for someone is a success, not a failure.
- *   disengaged             not reading Echo AND nothing moving -> tell Ben
- *   responding_not_moving  answering every time, clearing nothing -> tell Ben
+ *   disengaged             not reading Echo AND nothing moving -> tell admins
+ *   responding_not_moving  answering every time, clearing nothing -> tell admins
  *
  * That third and fourth pair is the point: the person Echo escalates is the one
  * who replies politely and clears nothing, not the one who ignores it while
  * getting on with the job.
+ *
+ * ROUTING: every escalation goes to every super admin, including the person it
+ * is about. There is no back-channel — nothing is said about someone that is
+ * not also said to them. When the recipient is the subject the copy switches to
+ * second person; the facts and the trigger are identical either way.
  */
 
 const WINDOW_DAYS = 14
+
+// How long Echo stays quiet on an escalated backlog. This was previously null,
+// which read as "until an admin releases it" — but nothing in this file or in
+// nudge ever released it, and echo_may_message() blocks on any open escalation.
+// The effect was a permanent, silent mute that could only be cleared by hand in
+// Supabase. An expiry matching the evaluation window gives a fortnight for the
+// conversation to happen and then lets Echo resume on its own.
+const SUPPRESS_DAYS = 14
+
+type Admin = { id: string; full_name: string; slack_user_id: string | null }
 
 async function main() {
   const db = echoDb()
@@ -36,6 +50,29 @@ async function main() {
 
   const today = londonDay(new Date())
   const windowStart = londonDay(new Date(Date.now() - WINDOW_DAYS * 86_400_000))
+  const suppressUntil = londonDay(new Date(Date.now() + SUPPRESS_DAYS * 86_400_000))
+
+  // Resolved once, up front. Previously this used .maybeSingle(), which errors
+  // on more than one row — so the day a second super admin was added, the query
+  // returned an error, the error was never destructured, admin came back null,
+  // and every escalation silently went nowhere while the job still reported
+  // success. Fetch the list, check it, and fail loudly if it is empty.
+  const adminQ = await db
+    .from('echo_person')
+    .select('id, full_name, slack_user_id')
+    .eq('is_super_admin', true)
+  if (adminQ.error) throw new Error(`Cannot read super admins: ${adminQ.error.message}`)
+
+  const admins = (adminQ.data ?? []) as Admin[]
+  if (!admins.length) {
+    console.log('No super admins found — nothing can be escalated to anyone. Stopping.')
+    return
+  }
+  const unreachable = admins.filter((a) => !a.slack_user_id)
+  for (const a of unreachable) {
+    console.log(`WARNING: ${a.full_name} is a super admin with no Slack id — will not receive escalations.`)
+  }
+  console.log(`${admins.length} super admin(s): ${admins.map((a) => a.full_name).join(', ')}`)
 
   // 1. Build this window's progress row for every member of staff. Nothing else
   //    writes these, so the alarm bell has nothing to evaluate without it.
@@ -105,10 +142,10 @@ async function main() {
   if (health.data?.echo_is_the_problem) {
     const msg =
       `*${health.data.not_engaging} of ${health.data.evaluated} people have stopped answering Echo.*\n\n` +
-      `That's Echo, not them. Recommend pausing nudges and reviewing the copy and ` +
-      `thresholds before this trains the whole team to ignore it.`
+      `That is Echo, not the team. Recommend pausing nudges and reviewing the copy and ` +
+      `thresholds before this trains everyone to ignore it.`
     assertNoPronouns(msg)
-    await notifyAdmin(db, msg, dryRun)
+    await notifyAdmins(admins, dryRun, () => msg)
     console.log('ECHO_NOT_WORKING raised; individual escalations suppressed.')
     return
   }
@@ -122,7 +159,7 @@ async function main() {
     if (d.action === 'none') continue
 
     if (d.action === 'ease_off') {
-      // Not a problem to bring Ben. Reduce the cadence and stay quiet.
+      // Not a problem to bring an admin. Reduce the cadence and stay quiet.
       easedOff++
       console.log(`${d.full_name}: ease_off — ignoring Echo but doing the work. Nobody told.`)
       continue
@@ -134,6 +171,8 @@ async function main() {
       continue
     }
 
+    // Stored canonically in the third person. Rendering per recipient happens
+    // below; the database keeps one version of the facts.
     const diagnosis =
       d.kind === 'disengaged'
         ? `${d.asks_made} asks over ${WINDOW_DAYS} days, ${d.asks_answered} answered, nothing cleared. ` +
@@ -156,42 +195,95 @@ async function main() {
       items_resolved: d.items_resolved,
       diagnosis,
       suggestion,
-      // Echo goes QUIET on this person's backlog until Ben releases it.
-      // Continuing to nudge someone Ben is now talking to directly is exactly
-      // the "keeping you on their back" problem this design avoids.
-      suppresses_until: null,
+      suppresses_until: suppressUntil,
     })
     if (ins.error) { console.error(`escalation insert failed: ${ins.error.message}`); continue }
 
-    const msg =
-      `*Echo isn't getting anywhere with ${d.full_name}*\n\n` +
-      `${diagnosis}\n\n` +
-      `${suggestion}\n\n` +
-      `_Echo will stay quiet on this backlog until you say otherwise._`
-    assertNoPronouns(msg)
-    await notifyAdmin(db, msg, dryRun)
+    await notifyAdmins(admins, dryRun, (recipient) =>
+      escalationText({
+        recipientIsSubject: recipient.id === d.person_id,
+        subjectName: d.full_name as string,
+        kind: d.kind as string,
+        diagnosis,
+        suggestion,
+        suppressUntil,
+        otherAdmins: admins.filter((a) => a.id !== recipient.id).map((a) => a.full_name),
+      }),
+    )
     raised++
   }
 
   console.log(`\nEscalations raised: ${raised}. Eased off: ${easedOff}. Blockers: ${blockers}.`)
 }
 
-async function notifyAdmin(db: ReturnType<typeof echoDb>, text: string, dryRun: boolean) {
-  const { data: admin } = await db
-    .from('echo_person')
-    .select('full_name, slack_user_id')
-    .eq('is_super_admin', true)
-    .maybeSingle()
-  if (!admin?.slack_user_id) {
-    console.log(`(no super admin Slack id — would have sent)\n${text}`)
-    return
+/**
+ * One escalation, rendered for one recipient.
+ *
+ * The subject receives the same message as everyone else, in second person.
+ * Writing about someone in the third person and then delivering it to them is
+ * how Monday's message ended up reading as a report filed against its own
+ * reader.
+ */
+function escalationText(o: {
+  recipientIsSubject: boolean
+  subjectName: string
+  kind: string
+  diagnosis: string
+  suggestion: string
+  suppressUntil: string
+  otherAdmins: string[]
+}): string {
+  const until = dayLabel(o.suppressUntil)
+
+  if (!o.recipientIsSubject) {
+    return (
+      `*Echo isn't getting anywhere with ${o.subjectName}*\n\n` +
+      `${o.diagnosis}\n\n` +
+      `${o.suggestion}\n\n` +
+      `_Echo will stay quiet on this backlog until ${until}. ${o.subjectName} has had this message too._`
+    )
   }
-  if (dryRun) {
-    console.log(`\n--- would send to ${admin.full_name} ---\n${text}\n`)
-    return
+
+  const selfSuggestion =
+    o.kind === 'disengaged'
+      ? `Most likely too much in the queue to engage with any of it, or the asks aren't landing. ` +
+        `A triage session rather than more nudges.`
+      : `Answering every time and clearing nothing usually means blocked or underwater.`
+
+  const seenBy = o.otherAdmins.length
+    ? ` ${o.otherAdmins.join(' and ')} received the same message.`
+    : ''
+
+  return (
+    `*Echo hasn't been getting anywhere with your backlog*\n\n` +
+    `${o.diagnosis}\n\n` +
+    `${selfSuggestion}\n\n` +
+    `_Echo will stay quiet on this backlog until ${until}.${seenBy}_`
+  )
+}
+
+async function notifyAdmins(
+  admins: Admin[],
+  dryRun: boolean,
+  build: (recipient: Admin) => string,
+) {
+  for (const a of admins) {
+    if (!a.slack_user_id) continue
+    const text = build(a)
+    assertNoPronouns(text)
+    if (dryRun) {
+      console.log(`\n--- would send to ${a.full_name} ---\n${text}\n`)
+      continue
+    }
+    await sendDm(a.slack_user_id, text)
+    console.log(`Escalation sent to ${a.full_name}.`)
   }
-  await sendDm(admin.slack_user_id, text)
-  console.log(`Escalation sent to ${admin.full_name}.`)
+}
+
+function dayLabel(day: string): string {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/London', weekday: 'short', day: 'numeric', month: 'short',
+  }).format(new Date(`${day}T12:00:00Z`))
 }
 
 main().catch((e) => {
