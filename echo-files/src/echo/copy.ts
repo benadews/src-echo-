@@ -9,6 +9,9 @@
  *     named. `assertNoPronouns` is run over every composed message and in CI.
  *
  *  2. Echo never states a duration. It reports what happened and asks.
+ *
+ *  A third rule, learned the hard way: Echo never reports a timestamp it cannot
+ *  stand behind. See `hasUsableTiming` below.
  */
 
 export interface ProjectLine {
@@ -90,6 +93,26 @@ export function assertTriageCopy(text: string): void {
   assertCopy(text, BANNED_TRIAGE)
 }
 
+/**
+ * Can this project line's timing be quoted?
+ *
+ * When first and last signal carry the same clock time, the sync has stamped
+ * its own run time on records it could not date rather than reading the real
+ * timestamp from Teamwork. Quoting it produced "5 updates in one sitting,
+ * 10:58–10:58" — a range of zero minutes containing five things, on three
+ * different projects, all at the same instant. Anyone reading a description of
+ * their own day spots that immediately, and it costs the message the benefit of
+ * the doubt on the counts, which are real.
+ *
+ * So: no range, and no sitting claim, since "one sitting" is derived from the
+ * same two timestamps. The counts still stand on their own.
+ *
+ * This is a guard, not a fix. The sync is what needs correcting.
+ */
+function hasUsableTiming(p: ProjectLine): boolean {
+  return Boolean(p.from) && Boolean(p.to) && p.from !== p.to
+}
+
 export function timeQuestion(opts: {
   completedTask: string | null
   signals: number
@@ -102,12 +125,19 @@ export function timeQuestion(opts: {
   singleSitting?: boolean
 }): string {
   const { completedTask, signals, projects, tone, dayLabel, teamworkBase } = opts
-  const sitting = opts.singleSitting ? ' in one sitting' : ''
+
+  // The day-level sitting claim rests on the same timestamps as the per-project
+  // ones. If not a single project has usable timing, the claim has nothing
+  // underneath it and is dropped.
+  const anyUsableTiming = projects.some(hasUsableTiming)
+  const sitting = opts.singleSitting && anyUsableTiming ? ' in one sitting' : ''
+
   const link = (p: ProjectLine) => `<${projectTimeUrl(teamworkBase, p.projectId)}|*${p.name}*>`
-  const count = (p: ProjectLine) =>
-    `${p.signals} update${p.signals === 1 ? '' : 's'}` +
-    (p.singleSitting ? ' in one sitting' : '') +
-    `, ${p.from}–${p.to}`
+  const count = (p: ProjectLine) => {
+    const updates = `${p.signals} update${p.signals === 1 ? '' : 's'}`
+    if (!hasUsableTiming(p)) return updates
+    return updates + (p.singleSitting ? ' in one sitting' : '') + `, ${p.from}–${p.to}`
+  }
   const lines: string[] = []
 
   if (tone === 'soft') {
